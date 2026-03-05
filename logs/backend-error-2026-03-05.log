@@ -1,0 +1,8 @@
+INFO:     Started server process [5024]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[2026-03-05 15:47:54] [INFO] Manual energy logger: ON (zone/area power from zones)
+[2026-03-05 15:47:54] [PID:14388] [WARNING] [PROCESS_LOCK] Found stale lock file from dead process | StalePID: 17440 | CurrentPID: 14388 | LockFile: C:\Users\harsh\AppData\Local\Temp\energy_logger.lock | Context: PID=14388, TID=14252
+[2026-03-05 15:47:54] [INFO] Starting listener for 0 processors
+[2026-03-05 15:47:54] [WARNING] No processors with handshake_status=True found
