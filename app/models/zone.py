@@ -12,8 +12,10 @@ class Zone(Base):
     type = Column(String(50))
     area_id = Column(Integer, ForeignKey("areas.id", ondelete="CASCADE"), nullable=False)
 
-    # Manual energy logger: max power (W) and high end trim (%); optional, no default
+    # Manual energy logger: optional per-zone load tuning fields
     max_power = Column(Float, nullable=True)
     high_end_trim = Column(Float, nullable=True)
+    energy_trim = Column(Float, nullable=True)
+    low_end_trim = Column(Float, nullable=True)
 
     area = relationship("Area", back_populates="zones")

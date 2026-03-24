@@ -34,6 +34,8 @@ from app.utils.activity_logger import log_activity
 from app.dependencies.permissions import require_operator_permission_for_scope
 from app.utils.activity_report_logger import activity_report_log
 from app.models.user_model import UserPermission
+from app.models.zone import Zone
+from app.utils.processor_trim import fetch_zone_trims_from_processor
 
 
 
@@ -42,6 +44,53 @@ router = APIRouter()
 # Ensure upload directory exists
 UPLOAD_DIR = os.path.join("app", "floor_plans")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _energy_logger_manual_enabled() -> bool:
+    value = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower()
+    return value in ("true", "1", "yes")
+
+
+def _sync_zone_trims_for_processor(db: Session, processor_id: int) -> None:
+    """
+    Best-effort trim sync for a processor. Does not raise by design.
+    """
+    processor = db.query(Processor).filter(Processor.id == processor_id).first()
+    if not processor:
+        return
+
+    trim_map, _errors = fetch_zone_trims_from_processor(processor=processor)
+    if not trim_map:
+        return
+
+    for zone_code, trim_values in trim_map.items():
+        zone = (
+            db.query(Zone)
+            .join(Area, Zone.area_id == Area.id)
+            .filter(Area.processor_id == processor_id, Zone.code == str(zone_code))
+            .first()
+        )
+        if not zone:
+            try:
+                zone_id_value = int(zone_code)
+            except (TypeError, ValueError):
+                zone_id_value = None
+            if zone_id_value is not None:
+                zone = (
+                    db.query(Zone)
+                    .join(Area, Zone.area_id == Area.id)
+                    .filter(Area.processor_id == processor_id, Zone.id == zone_id_value)
+                    .first()
+                )
+        if not zone or not isinstance(trim_values, dict):
+            continue
+
+        if trim_values.get("high_end_trim") is not None:
+            zone.high_end_trim = trim_values["high_end_trim"]
+        if trim_values.get("energy_trim") is not None:
+            zone.energy_trim = trim_values["energy_trim"]
+        if trim_values.get("low_end_trim") is not None:
+            zone.low_end_trim = trim_values["low_end_trim"]
 
 class ProcessorAreaMapping(BaseModel):
     processor_id: Optional[int]
@@ -132,6 +181,19 @@ async def upload_floor(
         )
 
         db.commit()
+
+        if not _energy_logger_manual_enabled():
+            processor_ids = sorted({
+                int(m.processor_id) for m in request.processors
+                if getattr(m, "processor_id", None) is not None
+            })
+            for processor_id in processor_ids:
+                try:
+                    _sync_zone_trims_for_processor(db=db, processor_id=processor_id)
+                except Exception:
+                    # Keep floor create behavior unchanged if trim sync fails.
+                    pass
+            db.commit()
 
         # Log each updated area (existing only, no new activity_report_log here)
         for area in updated_areas:
@@ -250,6 +312,25 @@ async def update_floor(
                 raise HTTPException(status_code=400, detail=f"Invalid 'processors' input: {str(e)}")
 
         db.commit()
+
+        if not _energy_logger_manual_enabled():
+            processor_ids = set()
+            if processors:
+                for mapping in validated_processors:
+                    if getattr(mapping, "processor_id", None) is not None:
+                        processor_ids.add(int(mapping.processor_id))
+            else:
+                mapped = db.query(FloorProcMapping).filter(FloorProcMapping.floor_id == floor_id).all()
+                for mapping in mapped:
+                    if getattr(mapping, "processor_id", None) is not None:
+                        processor_ids.add(int(mapping.processor_id))
+            for processor_id in sorted(processor_ids):
+                try:
+                    _sync_zone_trims_for_processor(db=db, processor_id=processor_id)
+                except Exception:
+                    # Keep floor update behavior unchanged if trim sync fails.
+                    pass
+            db.commit()
 
         # Existing log
         log_activity(

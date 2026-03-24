@@ -34,6 +34,8 @@ engine = create_engine(DATABASE_URL)
 ALTERS = [
     ("zones", "max_power", "ADD COLUMN IF NOT EXISTS max_power DOUBLE PRECISION"),
     ("zones", "high_end_trim", "ADD COLUMN IF NOT EXISTS high_end_trim DOUBLE PRECISION"),
+    ("zones", "energy_trim", "ADD COLUMN IF NOT EXISTS energy_trim DOUBLE PRECISION"),
+    ("zones", "low_end_trim", "ADD COLUMN IF NOT EXISTS low_end_trim DOUBLE PRECISION"),
     (
         "processor_zone_events",
         "zone_instantaneous_power",

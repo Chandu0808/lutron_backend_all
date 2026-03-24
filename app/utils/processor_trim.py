@@ -1,10 +1,10 @@
 """
-Fetch high_end_trim from processor for dimmed load controllers only.
+Fetch zone tuning trims from processor for dimmed load controllers only.
 Single connection, sequential ReadRequests (same pattern as other heavy-load processor APIs).
 """
 from typing import Dict, List, Optional, Tuple
 
-from app.utils.logger import zone_load_manual_energy_logger
+from app.utils.logger import listener_logger as zone_load_manual_energy_logger
 from app.utils.json_connection import (
     create_ssl_connection,
     send_json,
@@ -56,9 +56,9 @@ def _is_dimmed(loadcontroller_body: dict) -> bool:
     return False
 
 
-def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dict[str, float], List[str]]:
+def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[str, Dict[str, float]], List[str]]:
     """
-    Fetch HighEndTrim from processor for dimmed load controllers only.
+    Fetch HighEndTrim, EnergyTrim and LowEndTrim from processor for dimmed load controllers only.
     One connection, sequential ReadRequests. Non-dimmed (switched, shade, etc.) are skipped.
 
     Args:
@@ -66,10 +66,10 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
         timeout: Socket timeout in seconds.
 
     Returns:
-        (zone_code_str -> high_end_trim, list of error messages).
+        (zone_code_str -> trims dict, list of error messages).
     """
     errors: List[str] = []
-    result: Dict[str, float] = {}
+    result: Dict[str, Dict[str, float]] = {}
 
     processor_id = getattr(processor, "id", None)
     if not processor or not getattr(processor, "ipv4", None) or not getattr(processor, "mac", None) or not getattr(processor, "system", None):
@@ -90,7 +90,7 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
         zone_load_manual_energy_logger.warning("[TRIM] %s | processor_id=%s ipv4=%s", msg, processor_id, getattr(processor, "ipv4", None))
         return {}, [msg]
 
-    zone_load_manual_energy_logger.info("[TRIM] Connected | processor_id=%s ipv4=%s", processor_id, getattr(processor, "ipv4", None))
+    zone_load_manual_energy_logger.debug("[TRIM] Connected | processor_id=%s ipv4=%s", processor_id, getattr(processor, "ipv4", None))
     try:
         send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": "/loadcontroller/status"}})
         resp = recv_json(sock)
@@ -104,7 +104,7 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
         if not isinstance(body, dict):
             body = {}
         lc_ids = _extract_loadcontroller_ids(body)
-        zone_load_manual_energy_logger.info(
+        zone_load_manual_energy_logger.debug(
             "[TRIM] /loadcontroller/status | processor_id=%s lc_ids_count=%s lc_ids_sample=%s",
             processor_id, len(lc_ids), lc_ids[:15] if lc_ids else [],
         )
@@ -133,14 +133,14 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
             zone_href = assoc_zone.get("href") if isinstance(assoc_zone, dict) else assoc_zone
             zone_code = _zone_code_from_zone_href(zone_href)
             is_dimmed = _is_dimmed(lc_body)
-            zone_load_manual_energy_logger.info(
+            zone_load_manual_energy_logger.debug(
                 "[TRIM] LC detail | lc_id=%s zone_code=%s is_dimmed=%s has_DimmedLoadControllerProperties=%s has_TuningSettings_href=%s",
                 lc_id, zone_code, is_dimmed,
                 "DimmedLoadControllerProperties" in lc_body if isinstance(lc_body, dict) else False,
                 bool(isinstance(lc_body.get("TuningSettings"), dict) and lc_body.get("TuningSettings", {}).get("href")) if isinstance(lc_body, dict) else False,
             )
             if zone_code is None:
-                zone_load_manual_energy_logger.info("[TRIM] Skip (no zone_code) | lc_id=%s assoc_zone=%s", lc_id, assoc_zone)
+                zone_load_manual_energy_logger.debug("[TRIM] Skip (no zone_code) | lc_id=%s assoc_zone=%s", lc_id, assoc_zone)
                 continue
 
             if not is_dimmed:
@@ -160,17 +160,34 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
                 zone_load_manual_energy_logger.warning("[TRIM] %s", err)
                 continue
             high_end = ts_body.get("HighEndTrim")
-            zone_load_manual_energy_logger.info(
-                "[TRIM] Tuningsettings | lc_id=%s zone_code=%s HighEndTrim=%s ts_body_keys=%s",
-                lc_id, zone_code, high_end, list(ts_body.keys()) if isinstance(ts_body, dict) else "n/a",
+            energy = ts_body.get("EnergyTrim")
+            low_end = ts_body.get("LowEndTrim")
+            zone_load_manual_energy_logger.debug(
+                "[TRIM] Tuningsettings | lc_id=%s zone_code=%s HighEndTrim=%s EnergyTrim=%s LowEndTrim=%s ts_body_keys=%s",
+                lc_id, zone_code, high_end, energy, low_end, list(ts_body.keys()) if isinstance(ts_body, dict) else "n/a",
             )
-            if high_end is not None:
+            trim_values: Dict[str, float] = {}
+            for key, source_value in (
+                ("high_end_trim", high_end),
+                ("energy_trim", energy),
+                ("low_end_trim", low_end),
+            ):
                 try:
-                    val = float(high_end)
-                    result[str(zone_code)] = val
-                    zone_load_manual_energy_logger.info("[TRIM] Added trim | zone_code=%s high_end_trim=%s", zone_code, val)
+                    if source_value is None:
+                        continue
+                    trim_values[key] = float(source_value)
                 except (TypeError, ValueError):
-                    zone_load_manual_energy_logger.warning("[TRIM] HighEndTrim not float | lc_id=%s zone_code=%s value=%s", lc_id, zone_code, high_end)
+                    zone_load_manual_energy_logger.warning(
+                        "[TRIM] %s not float | lc_id=%s zone_code=%s value=%s",
+                        key, lc_id, zone_code, source_value
+                    )
+            if trim_values:
+                result[str(zone_code)] = trim_values
+                zone_load_manual_energy_logger.debug(
+                    "[TRIM] Added trims | zone_code=%s values=%s",
+                    zone_code,
+                    trim_values,
+                )
     finally:
         try:
             sock.close()
@@ -178,3 +195,22 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
             pass
 
     return result, errors
+
+
+def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dict[str, float], List[str]]:
+    """
+    Backward-compatible wrapper around fetch_zone_trims_from_processor.
+    Returns only HighEndTrim values.
+    """
+    trim_map, errors = fetch_zone_trims_from_processor(processor=processor, timeout=timeout)
+    high_only: Dict[str, float] = {}
+    for zone_code, trims in trim_map.items():
+        if not isinstance(trims, dict):
+            continue
+        if trims.get("high_end_trim") is None:
+            continue
+        try:
+            high_only[str(zone_code)] = float(trims["high_end_trim"])
+        except (TypeError, ValueError):
+            continue
+    return high_only, errors

@@ -42,6 +42,22 @@ class UploadZonewiseLoadResponse(BaseModel):
     errors: List[str]
 
 
+class ZoneTuningOut(BaseModel):
+    zone_id: int
+    zone_code: Optional[str]
+    zone_name: str
+    high_end_trim: Optional[float]
+    energy_trim: Optional[float]
+    low_end_trim: Optional[float]
+
+
+class AreaTuningSettingsResponse(BaseModel):
+    status: str
+    area_id: int
+    area_name: Optional[str]
+    zones: List[ZoneTuningOut]
+
+
 class ZoneMissingLoadOut(BaseModel):
     zone_id: int
     zone_code: Optional[str]
@@ -133,6 +149,44 @@ def list_zones_by_area(area_id: int = Query(..., description="Area ID to filter 
     return {"status": "success", "zones": zones}
 
 
+@router.get("/tunning_settings", response_model=AreaTuningSettingsResponse)
+def get_area_tunning_settings(
+    area_id: int = Query(..., description="Area ID to fetch zone-wise tuning settings"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Returns zone-wise tuning settings for an area from DB columns:
+    high_end_trim, energy_trim, low_end_trim.
+    """
+    area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Area not found")
+
+    zones = (
+        db.query(Zone)
+        .filter(Zone.area_id == area_id)
+        .order_by(Zone.name.asc())
+        .all()
+    )
+    return {
+        "status": "success",
+        "area_id": area.id,
+        "area_name": area.name,
+        "zones": [
+            {
+                "zone_id": zone.id,
+                "zone_code": zone.code,
+                "zone_name": zone.name,
+                "high_end_trim": zone.high_end_trim,
+                "energy_trim": zone.energy_trim,
+                "low_end_trim": zone.low_end_trim,
+            }
+            for zone in zones
+        ],
+    }
+
+
 @router.post("/upload_zonewise_load_csv", response_model=UploadZonewiseLoadResponse)
 def upload_zonewise_load_csv(
     file: UploadFile = File(..., description="Load Schedule CSV (zone-wise load)"),
@@ -203,3 +257,5 @@ def upload_zonewise_load_csv(
         "dimmed_zones_without_trim": dimmed_without_trim,
         "errors": errors,
     }
+
+
