@@ -12,6 +12,7 @@ from app.models.drivers import Driver
 from app.models.area import Area
 from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.sensors_and_modules import SensorAndModule
+from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.crud.schedule import fetch_combined_schedules
 
@@ -24,6 +25,24 @@ def _format_datetime_to_ist(dt: Optional[datetime]) -> Optional[str]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(ist_tz).strftime("%d-%m-%Y %H.%M")
+
+
+_DEFAULT_ALERT_TYPE_DISPLAY = {
+    "Processor Not Responding": True,
+    "Device Not Responding": True,
+    "Ballast Failure": True,
+    "Lamp Failure": True,
+    "Other Warnings": True,
+}
+
+
+def _get_alert_type_display_map(db: Session) -> Dict[str, bool]:
+    """Global alert visibility per alert type."""
+    type_map: Dict[str, bool] = dict(_DEFAULT_ALERT_TYPE_DISPLAY)
+    rows = db.query(AlertTypeDisplaySetting).all()
+    for r in rows:
+        type_map[r.alert_type] = bool(r.display)
+    return type_map
 
 
 def _get_area_full_path_from_processor(
@@ -76,17 +95,58 @@ def get_active_alerts_list_for_dashboard(
             if getattr(p, "floor_id", None) is not None
         ]
 
+    type_display_map = _get_alert_type_display_map(db)
+
     # Processor Alerts
-    q_processors = db.query(Processor).filter(Processor.ping_status == "not_ok")
-    if getattr(current_user, "role", None) == "Operator":
-        q_processors = q_processors.join(
-            FloorProcMapping, FloorProcMapping.processor_id == Processor.id
-        ).filter(FloorProcMapping.floor_id.in_(allowed_floor_ids))
-    for p in q_processors.all():
-        location = None
-        if p.associated_area:
-            area_code = p.associated_area.split("/")[-1] if "/" in p.associated_area else p.associated_area
-            area = db.query(Area).filter(Area.code == area_code, Area.processor_id == p.id).first()
+    if type_display_map.get("Processor Not Responding", True):
+        q_processors = db.query(Processor).filter(
+            Processor.ping_status == "not_ok",
+            Processor.display.is_(True),
+        )
+        if getattr(current_user, "role", None) == "Operator":
+            q_processors = q_processors.join(
+                FloorProcMapping, FloorProcMapping.processor_id == Processor.id
+            ).filter(FloorProcMapping.floor_id.in_(allowed_floor_ids))
+        for p in q_processors.all():
+            location = None
+            if p.associated_area:
+                area_code = p.associated_area.split("/")[-1] if "/" in p.associated_area else p.associated_area
+                area = db.query(Area).filter(Area.code == area_code, Area.processor_id == p.id).first()
+                if area:
+                    location_parts = []
+                    if area.floor and area.floor.name:
+                        location_parts.append(area.floor.name)
+                    if area.name:
+                        location_parts.append(area.name)
+                    location = "/".join(location_parts) if location_parts else None
+                else:
+                    location = _get_area_full_path_from_processor(p.ipv4, p.mac, p.system, area_code)
+            results.append({
+                "location": location,
+                "alert_type": "processor not responding",
+                "device_name": p.system,
+                "serial_no": p.serial,
+                "model_number": p.model_number,
+                "description": "not pingable",
+                "time": _format_datetime_to_ist(p.created_at),
+                "reported_time": _format_datetime_to_ist(p.reported_time),
+                "solved_time": _format_datetime_to_ist(p.solved_time),
+                "last_updated_time": _format_datetime_to_ist(p.created_at),
+            })
+
+    # Device Alerts
+    if type_display_map.get("Device Not Responding", True):
+        bad_devices = db.query(SensorAndModule).filter(
+            SensorAndModule.alert_status == "not_ok",
+            SensorAndModule.display.is_(True),
+        ).all()
+        for dev in bad_devices:
+            location = None
+            area = None
+            if dev.area_id:
+                area = db.query(Area).filter(Area.id == dev.area_id).first()
+            if area and getattr(current_user, "role", None) == "Operator" and area.floor_id not in allowed_floor_ids:
+                continue
             if area:
                 location_parts = []
                 if area.floor and area.floor.name:
@@ -94,63 +154,40 @@ def get_active_alerts_list_for_dashboard(
                 if area.name:
                     location_parts.append(area.name)
                 location = "/".join(location_parts) if location_parts else None
-            else:
-                location = _get_area_full_path_from_processor(p.ipv4, p.mac, p.system, area_code)
-        results.append({
-            "location": location,
-            "alert_type": "processor not responding",
-            "device_name": p.system,
-            "serial_no": p.serial,
-            "model_number": p.model_number,
-            "description": "not pingable",
-            "time": _format_datetime_to_ist(p.created_at),
-            "reported_time": _format_datetime_to_ist(p.reported_time),
-            "solved_time": _format_datetime_to_ist(p.solved_time),
-            "last_updated_time": _format_datetime_to_ist(p.created_at),
-        })
-
-    # Device Alerts
-    bad_devices = db.query(SensorAndModule).filter(SensorAndModule.alert_status == "not_ok").all()
-    for dev in bad_devices:
-        location = None
-        area = None
-        if dev.area_id:
-            area = db.query(Area).filter(Area.id == dev.area_id).first()
-        if area and getattr(current_user, "role", None) == "Operator" and area.floor_id not in allowed_floor_ids:
-            continue
-        if area:
-            location_parts = []
-            if area.floor and area.floor.name:
-                location_parts.append(area.floor.name)
-            if area.name:
-                location_parts.append(area.name)
-            location = "/".join(location_parts) if location_parts else None
-        elif getattr(dev, "area_code", None) and getattr(dev, "processor_id", None):
-            proc = db.query(Processor).filter(Processor.id == dev.processor_id).first()
-            if proc:
-                location = _get_area_full_path_from_processor(
-                    proc.ipv4, proc.mac, proc.system, str(dev.area_code)
-                )
-        results.append({
-            "location": location,
-            "alert_type": "Device Not Responding",
-            "device_name": dev.device_name,
-            "serial_no": dev.serial_number,
-            "model_number": dev.device_model,
-            "description": "",
-            "time": _format_datetime_to_ist(dev.created_at),
-            "reported_time": _format_datetime_to_ist(dev.reported_time),
-            "solved_time": _format_datetime_to_ist(dev.solved_time),
-            "last_updated_time": _format_datetime_to_ist(dev.created_at),
-        })
+            elif getattr(dev, "area_code", None) and getattr(dev, "processor_id", None):
+                proc = db.query(Processor).filter(Processor.id == dev.processor_id).first()
+                if proc:
+                    location = _get_area_full_path_from_processor(
+                        proc.ipv4, proc.mac, proc.system, str(dev.area_code)
+                    )
+            results.append({
+                "location": location,
+                "alert_type": "Device Not Responding",
+                "device_name": dev.device_name,
+                "serial_no": dev.serial_number,
+                "model_number": dev.device_model,
+                "description": "",
+                "time": _format_datetime_to_ist(dev.created_at),
+                "reported_time": _format_datetime_to_ist(dev.reported_time),
+                "solved_time": _format_datetime_to_ist(dev.solved_time),
+                "last_updated_time": _format_datetime_to_ist(dev.created_at),
+            })
 
     # Driver Alerts
     driver_types = {"E2": "Ballast Failure", "FC": "Lamp Failure"}
     drivers = db.query(Driver).filter(
         Driver.alert_status.in_(["not_ok", "not_okay"]),
         Driver.area_id.isnot(None),
+        Driver.display.is_(True),
     ).all()
     for d in drivers:
+        # Exclude driver rows with NULL/empty error_code from being shown as
+        # "Other Warnings" on the dashboard.
+        if d.error_code is None:
+            continue
+        if isinstance(d.error_code, str) and d.error_code.strip() == "":
+            continue
+
         location = None
         area = None
         if d.area_id:
@@ -158,6 +195,8 @@ def get_active_alerts_list_for_dashboard(
         if area and getattr(current_user, "role", None) == "Operator" and area.floor_id not in allowed_floor_ids:
             continue
         alert_type = driver_types.get(d.error_code, "Other Warnings")
+        if not type_display_map.get(alert_type, True):
+            continue
         if area:
             location_parts = []
             if area.floor and area.floor.name:

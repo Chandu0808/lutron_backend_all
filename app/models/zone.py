@@ -17,5 +17,7 @@ class Zone(Base):
     high_end_trim = Column(Float, nullable=True)
     energy_trim = Column(Float, nullable=True)
     low_end_trim = Column(Float, nullable=True)
+    # LEAP load controller id from href /loadcontroller/{id}
+    loadcontroller_code = Column(Integer, nullable=True)
 
     area = relationship("Area", back_populates="zones")

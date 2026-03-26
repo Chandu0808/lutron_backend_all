@@ -18,6 +18,7 @@ from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.area import Area
 from app.models.sensors_and_modules import SensorAndModule
 from app.models.widget_title import WidgetTitle
+from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.dependencies.auth import get_current_user
 from app.dependencies.permissions import require_operator_permission_for_scope
@@ -63,6 +64,27 @@ def format_alert_type_for_csv(alert_type: str) -> str:
     elif alert_type_lower == "device not responding":
         return "Device Not Responding"
     return alert_type
+
+
+_DEFAULT_ALERT_TYPE_DISPLAY = {
+    "Processor Not Responding": True,
+    "Device Not Responding": True,
+    "Ballast Failure": True,
+    "Lamp Failure": True,
+    "Other Warnings": True,
+}
+
+
+def _get_alert_type_display_map(db: Session):
+    """
+    Global alert visibility per alert type.
+    Used to ensure disabling keeps working for alerts that arrive after the change.
+    """
+    type_map = dict(_DEFAULT_ALERT_TYPE_DISPLAY)
+    rows = db.query(AlertTypeDisplaySetting).all()
+    for r in rows:
+        type_map[r.alert_type] = bool(r.display)
+    return type_map
 
 
 def get_area_full_path_from_processor(ip: str, mac: str, system: str, area_code: str) -> Optional[str]:
@@ -146,6 +168,7 @@ def get_active_alerts(
         allowed_floor_ids = []
         if current_user.role == "Operator":
             allowed_floor_ids = [perm.floor_id for perm in current_user.user_permissions]
+        type_display_map = _get_alert_type_display_map(db)
 
         def include_type(alert_type: str) -> bool:
             if not types:
@@ -155,8 +178,11 @@ def get_active_alerts(
             return any(t.lower() == alert_type_lower for t in types)
 
         # Processor Alerts
-        if include_type("Processor Not Responding"):
-            q_processors = db.query(Processor).filter(Processor.ping_status == "not_ok")
+        if include_type("Processor Not Responding") and type_display_map.get("Processor Not Responding", True):
+            q_processors = db.query(Processor).filter(
+                Processor.ping_status == "not_ok",
+                Processor.display.is_(True),
+            )
             if current_user.role == "Operator":
                 q_processors = q_processors.join(
                     FloorProcMapping, FloorProcMapping.processor_id == Processor.id
@@ -199,9 +225,10 @@ def get_active_alerts(
                 })
 
         # Device Alerts
-        if include_type("Device Not Responding"):
+        if include_type("Device Not Responding") and type_display_map.get("Device Not Responding", True):
             bad_devices = db.query(SensorAndModule).filter(
-                SensorAndModule.alert_status == "not_ok"
+                SensorAndModule.alert_status == "not_ok",
+                SensorAndModule.display.is_(True),
             ).all()
             for dev in bad_devices:
                 location = None
@@ -253,9 +280,17 @@ def get_active_alerts(
         if include_type("Ballast Failure") or include_type("Lamp Failure") or include_type("Other Warnings"):
             drivers = db.query(Driver).filter(
                 Driver.alert_status.in_(["not_ok", "not_okay"]),
-                Driver.area_id.isnot(None)
+                Driver.area_id.isnot(None),
+                Driver.display.is_(True),
             ).all()
             for d in drivers:
+                # Exclude driver rows with NULL/empty error_code from being classified
+                # as "Other Warnings" (read-side only; recording logic unchanged).
+                if d.error_code is None:
+                    continue
+                if isinstance(d.error_code, str) and d.error_code.strip() == "":
+                    continue
+
                 location = None
                 area = None
                 
@@ -268,6 +303,8 @@ def get_active_alerts(
                     continue
                 
                 alert_type = driver_types.get(d.error_code, "Other Warnings")
+                if not type_display_map.get(alert_type, True):
+                    continue
                 if not include_type(alert_type):
                     continue
                 
@@ -335,19 +372,24 @@ def get_alert_types(
         allowed_floor_ids = []
         if current_user.role == "Operator":
             allowed_floor_ids = [perm.floor_id for perm in current_user.user_permissions]
+        type_display_map = _get_alert_type_display_map(db)
 
         # Processor
-        q_proc = db.query(Processor).filter(Processor.ping_status == "not_ok")
+        q_proc = db.query(Processor).filter(
+            Processor.ping_status == "not_ok",
+            Processor.display.is_(True),
+        )
         if current_user.role == "Operator":
             q_proc = q_proc.join(
                 FloorProcMapping, FloorProcMapping.processor_id == Processor.id
             ).filter(FloorProcMapping.floor_id.in_(allowed_floor_ids))
-        if q_proc.first():
+        if q_proc.first() and type_display_map.get("Processor Not Responding", True):
             alert_types.add("Processor Not Responding")
 
         # Devices
         q_devices = db.query(SensorAndModule).filter(
-            SensorAndModule.alert_status == "not_ok"
+            SensorAndModule.alert_status == "not_ok",
+            SensorAndModule.display.is_(True),
         ).all()
         for dev in q_devices:
             # Use area_id if available
@@ -360,15 +402,23 @@ def get_alert_types(
                 continue
             
             # Include devices even if area_id is null (they have area_code or processor_id)
-            alert_types.add("Device Not Responding")
+            if type_display_map.get("Device Not Responding", True):
+                alert_types.add("Device Not Responding")
             break
 
         # Drivers
         drivers = db.query(Driver).filter(
             Driver.alert_status.in_(["not_ok", "not_okay"]),
-            Driver.area_id.isnot(None)
+            Driver.area_id.isnot(None),
+            Driver.display.is_(True),
         ).all()
         for d in drivers:
+            # Exclude driver rows with NULL/empty error_code from dropdown types.
+            if d.error_code is None:
+                continue
+            if isinstance(d.error_code, str) and d.error_code.strip() == "":
+                continue
+
             # Use area_id if available
             area = None
             if d.area_id:
@@ -379,11 +429,14 @@ def get_alert_types(
             if current_user.role == "Operator" and area.floor_id not in allowed_floor_ids:
                 continue
             if d.error_code == "E2":
-                alert_types.add("Ballast Failure")
+                if type_display_map.get("Ballast Failure", True):
+                    alert_types.add("Ballast Failure")
             elif d.error_code == "FC":
-                alert_types.add("Lamp Failure")
+                if type_display_map.get("Lamp Failure", True):
+                    alert_types.add("Lamp Failure")
             else:
-                alert_types.add("Other Warnings")
+                if type_display_map.get("Other Warnings", True):
+                    alert_types.add("Other Warnings")
 
         return {"status": "success", "alert_types": list(alert_types)}
     except Exception as e:

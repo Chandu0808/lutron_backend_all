@@ -28,6 +28,10 @@ class Processor(Base):
     reported_time = Column(DateTime, nullable=True)  # When processor alert was first reported
     solved_time = Column(DateTime, nullable=True)    # When processor alert was resolved
 
+    # UI visibility toggle for alerts recorded in this table.
+    # Used by /settings/disable_alerts and read-side alert filters.
+    display = Column(Boolean, nullable=False, default=True)
+
     # Enrichment fields from /device/{id}
     associated_area = Column(String, nullable=True)   # href of AssociatedArea
     device_code = Column(String, nullable=True)       # href of device (/device/xxx)

@@ -56,26 +56,26 @@ def _is_dimmed(loadcontroller_body: dict) -> bool:
     return False
 
 
-def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[str, Dict[str, float]], List[str]]:
+def fetch_zone_trims_from_processor(
+    processor, timeout: int = 5
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, int], List[str]]:
     """
-    Fetch HighEndTrim, EnergyTrim and LowEndTrim from processor for dimmed load controllers only.
-    One connection, sequential ReadRequests. Non-dimmed (switched, shade, etc.) are skipped.
-
-    Args:
-        processor: Processor model with ipv4, mac, system.
-        timeout: Socket timeout in seconds.
+    Walk load controllers: map every AssociatedZone to loadcontroller id (href numeric id).
+    For dimmed controllers only, also fetch tuningsettings (HighEndTrim, EnergyTrim, LowEndTrim).
 
     Returns:
-        (zone_code_str -> trims dict, list of error messages).
+        (trim_map zone_code_str -> trims, loadcontroller_map zone_code_str -> lc_id, errors).
+        Multiple LCs per zone: last one in walk order wins for both maps.
     """
     errors: List[str] = []
     result: Dict[str, Dict[str, float]] = {}
+    loadcontroller_by_zone: Dict[str, int] = {}
 
     processor_id = getattr(processor, "id", None)
     if not processor or not getattr(processor, "ipv4", None) or not getattr(processor, "mac", None) or not getattr(processor, "system", None):
         msg = "Processor missing connection info (ipv4, mac, system)"
         zone_load_manual_energy_logger.warning("[TRIM] %s", msg)
-        return {}, [msg]
+        return {}, {}, [msg]
 
     sock = create_ssl_connection(
         processor.ipv4,
@@ -88,7 +88,7 @@ def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[s
     if not sock:
         msg = "Failed to connect to processor"
         zone_load_manual_energy_logger.warning("[TRIM] %s | processor_id=%s ipv4=%s", msg, processor_id, getattr(processor, "ipv4", None))
-        return {}, [msg]
+        return {}, {}, [msg]
 
     zone_load_manual_energy_logger.debug("[TRIM] Connected | processor_id=%s ipv4=%s", processor_id, getattr(processor, "ipv4", None))
     try:
@@ -98,7 +98,7 @@ def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[s
             msg = "No response from /loadcontroller/status"
             errors.append(msg)
             zone_load_manual_energy_logger.warning("[TRIM] %s | processor_id=%s", msg, processor_id)
-            return result, errors
+            return result, loadcontroller_by_zone, errors
 
         body = resp.get("Body") or resp.get("body") or {}
         if not isinstance(body, dict):
@@ -112,7 +112,7 @@ def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[s
             msg = "No load controllers in /loadcontroller/status response"
             errors.append(msg)
             zone_load_manual_energy_logger.warning("[TRIM] %s | processor_id=%s body_keys=%s", msg, processor_id, list(body.keys()) if isinstance(body, dict) else "n/a")
-            return result, errors
+            return result, loadcontroller_by_zone, errors
 
         for lc_id in lc_ids:
             send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": f"/loadcontroller/{lc_id}"}})
@@ -142,6 +142,8 @@ def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[s
             if zone_code is None:
                 zone_load_manual_energy_logger.debug("[TRIM] Skip (no zone_code) | lc_id=%s assoc_zone=%s", lc_id, assoc_zone)
                 continue
+
+            loadcontroller_by_zone[str(zone_code)] = lc_id
 
             if not is_dimmed:
                 continue
@@ -194,7 +196,7 @@ def fetch_zone_trims_from_processor(processor, timeout: int = 5) -> Tuple[Dict[s
         except Exception:
             pass
 
-    return result, errors
+    return result, loadcontroller_by_zone, errors
 
 
 def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dict[str, float], List[str]]:
@@ -202,7 +204,7 @@ def fetch_high_end_trim_from_processor(processor, timeout: int = 5) -> Tuple[Dic
     Backward-compatible wrapper around fetch_zone_trims_from_processor.
     Returns only HighEndTrim values.
     """
-    trim_map, errors = fetch_zone_trims_from_processor(processor=processor, timeout=timeout)
+    trim_map, _lc_map, errors = fetch_zone_trims_from_processor(processor=processor, timeout=timeout)
     high_only: Dict[str, float] = {}
     for zone_code, trims in trim_map.items():
         if not isinstance(trims, dict):

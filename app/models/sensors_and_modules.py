@@ -1,5 +1,5 @@
 # app/models/sensors_and_modules.py
-from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP, Index
+from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP, Index, Boolean
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.session import Base
@@ -32,6 +32,10 @@ class SensorAndModule(Base):
     # Status
     availability = Column(String, nullable=True)                 # "Available" | "Unavailable" | "Unknown"
     alert_status = Column(String, default="ok")                  # "ok" / "not_ok"
+
+    # UI visibility toggle for alerts recorded in this table.
+    # Used by /settings/disable_alerts and read-side alert filters.
+    display = Column(Boolean, nullable=False, default=True)
 
     # Timestamps
     created_at = Column(TIMESTAMP(timezone=True), nullable=True)

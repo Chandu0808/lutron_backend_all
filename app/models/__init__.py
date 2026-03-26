@@ -33,3 +33,4 @@ from .occupancy_logs import OccupancyLog
 from .activity_report import ActivityReport
 from .home import HomePageContent
 from .widget_title import WidgetTitle
+from .alert_type_display_settings import AlertTypeDisplaySetting

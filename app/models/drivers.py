@@ -1,5 +1,5 @@
 # app/models/drivers.py
-from sqlalchemy import Column, Integer, String, Text, TIMESTAMP, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Text, TIMESTAMP, ForeignKey, Index, Boolean
 from sqlalchemy.sql import func
 from app.database.session import Base
 
@@ -24,6 +24,10 @@ class Driver(Base):
     error_code = Column(String, nullable=True)      # Error identifier
     description = Column(Text, nullable=True)       # Human-readable explanation
     alert_status = Column(String, nullable=True)    # "ok" / "not_ok"
+
+    # UI visibility toggle for alerts recorded in this table.
+    # Used by /settings/disable_alerts and read-side alert filters.
+    display = Column(Boolean, nullable=False, default=True)
 
     # Timestamps
     created_at = Column(TIMESTAMP(timezone=True), nullable=True)

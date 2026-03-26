@@ -53,26 +53,27 @@ def _energy_logger_manual_enabled() -> bool:
 
 def _sync_zone_trims_for_processor(db: Session, processor_id: int) -> None:
     """
-    Best-effort trim sync for a processor. Does not raise by design.
+    Best-effort sync for a processor. Does not raise by design.
+    Updates loadcontroller_code for every zone with an AssociatedZone; updates trim columns only for dimmed.
     """
     processor = db.query(Processor).filter(Processor.id == processor_id).first()
     if not processor:
         return
 
-    trim_map, _errors = fetch_zone_trims_from_processor(processor=processor)
-    if not trim_map:
+    trim_map, loadcontroller_map, _errors = fetch_zone_trims_from_processor(processor=processor)
+    if not trim_map and not loadcontroller_map:
         return
 
-    for zone_code, trim_values in trim_map.items():
+    def _resolve_zone(zone_code_str: str):
         zone = (
             db.query(Zone)
             .join(Area, Zone.area_id == Area.id)
-            .filter(Area.processor_id == processor_id, Zone.code == str(zone_code))
+            .filter(Area.processor_id == processor_id, Zone.code == str(zone_code_str))
             .first()
         )
         if not zone:
             try:
-                zone_id_value = int(zone_code)
+                zone_id_value = int(zone_code_str)
             except (TypeError, ValueError):
                 zone_id_value = None
             if zone_id_value is not None:
@@ -82,6 +83,15 @@ def _sync_zone_trims_for_processor(db: Session, processor_id: int) -> None:
                     .filter(Area.processor_id == processor_id, Zone.id == zone_id_value)
                     .first()
                 )
+        return zone
+
+    for zone_code, lc_id in loadcontroller_map.items():
+        zone = _resolve_zone(str(zone_code))
+        if zone is not None:
+            zone.loadcontroller_code = lc_id
+
+    for zone_code, trim_values in trim_map.items():
+        zone = _resolve_zone(str(zone_code))
         if not zone or not isinstance(trim_values, dict):
             continue
 

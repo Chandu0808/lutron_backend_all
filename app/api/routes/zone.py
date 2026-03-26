@@ -46,6 +46,7 @@ class ZoneTuningOut(BaseModel):
     zone_id: int
     zone_code: Optional[str]
     zone_name: str
+    loadcontroller_code: Optional[int]
     high_end_trim: Optional[float]
     energy_trim: Optional[float]
     low_end_trim: Optional[float]
@@ -156,8 +157,7 @@ def get_area_tunning_settings(
     user: User = Depends(get_current_user),
 ):
     """
-    Returns zone-wise tuning settings for an area from DB columns:
-    high_end_trim, energy_trim, low_end_trim.
+    Returns zone-wise tuning settings from DB: loadcontroller_code, high_end_trim, energy_trim, low_end_trim.
     """
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:
@@ -166,6 +166,7 @@ def get_area_tunning_settings(
     zones = (
         db.query(Zone)
         .filter(Zone.area_id == area_id)
+        .filter(Zone.type.ilike("%dimmed%"))
         .order_by(Zone.name.asc())
         .all()
     )
@@ -178,6 +179,7 @@ def get_area_tunning_settings(
                 "zone_id": zone.id,
                 "zone_code": zone.code,
                 "zone_name": zone.name,
+                "loadcontroller_code": zone.loadcontroller_code,
                 "high_end_trim": zone.high_end_trim,
                 "energy_trim": zone.energy_trim,
                 "low_end_trim": zone.low_end_trim,
