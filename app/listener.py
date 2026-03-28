@@ -32,6 +32,7 @@ from app.activity_report import log_activity_report_for_area
 from app.utils.logger import listener_logger
 from app.utils.activity_logger import log_activity
 from app.models.energy_saving import AreaEnergySavingByStrategy
+from app.utils.area_trim_savings import compute_trim_savings_for_area
 from app.models.occupancy_logs import OccupancyLog
 from datetime import timedelta, datetime, timezone
 from sqlalchemy.sql import func
@@ -670,8 +671,10 @@ def check_area_occupancy(msg, db, processor_id):
                     prev_entry.energy_consumed_in_Wh = instantaneous_power * time_diff_hours
                     prev_entry.energy_saved_in_Wh = (instantaneous_max_power - instantaneous_power) * time_diff_hours
                     prev_entry.total_energy = (prev_entry.energy_consumed_in_Wh or 0) + (prev_entry.energy_saved_in_Wh or 0)
+                    trim_watts = compute_trim_savings_for_area(db, code, processor_id)
+                    prev_entry.trim_savings = trim_watts * time_diff_hours
 
-                # Insert new entry
+                # Insert new entry (open interval; trim_savings Wh applied when this row is closed)
                 new_entry = AreaEnergySavingByStrategy(
                     area_code=code,
                     processor_id=processor_id,  # Added for multi-processor support
@@ -681,6 +684,7 @@ def check_area_occupancy(msg, db, processor_id):
                     last_activity=chosen_report.activity_type,
                     activity_description=chosen_report.sub_activity_type,
                     strategy_type=strategy_type,
+                    trim_savings=None,
                 )
                 db.add(new_entry)
 
@@ -701,6 +705,8 @@ def check_area_occupancy(msg, db, processor_id):
                     prev_entry.energy_consumed_in_Wh = instantaneous_power * time_diff_hours
                     prev_entry.energy_saved_in_Wh = (instantaneous_max_power - instantaneous_power) * time_diff_hours
                     prev_entry.total_energy = (prev_entry.energy_consumed_in_Wh or 0) + (prev_entry.energy_saved_in_Wh or 0)
+                    trim_watts = compute_trim_savings_for_area(db, code, processor_id)
+                    prev_entry.trim_savings = trim_watts * time_diff_hours
                 else:
                     new_entry = AreaEnergySavingByStrategy(
                         area_code=code,
@@ -711,6 +717,7 @@ def check_area_occupancy(msg, db, processor_id):
                         last_activity=chosen_report.activity_type,
                         activity_description=chosen_report.sub_activity_type,
                         strategy_type="Sensors",
+                        trim_savings=None,
                     )
                     db.add(new_entry)
 

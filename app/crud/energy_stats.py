@@ -1612,6 +1612,145 @@ def _strategy_data_for_response(data: Dict[str, Any]) -> Dict[str, Any]:
     return {_strategy_display_name(k): v for k, v in data.items()}
 
 
+def _empty_strategy_data() -> Dict[str, Any]:
+    return {
+        "Keypad": 0,
+        "Sensors": 0,
+        "Schedule": 0,
+        "GUI": 0,
+        "Tuning": 0,
+        "Consumption": 0,
+    }
+
+
+def _area_energy_stat_consumption_and_savings_wh(
+    db: Session,
+    area_stat_conditions: List,
+    start_date: datetime,
+    end_date: datetime,
+) -> Tuple[float, float]:
+    """
+    Same Wh convention as area-group consumption and savings charts:
+    sum(instantaneous_power)/4 and sum(instantaneous_saved_power)/4 over created_date.
+    """
+    if not area_stat_conditions:
+        return 0.0, 0.0
+    row = (
+        db.query(
+            func.sum(AreaEnergyStat.instantaneous_power),
+            func.sum(AreaEnergyStat.instantaneous_saved_power),
+        )
+        .filter(AreaEnergyStat.created_date >= start_date.date())
+        .filter(AreaEnergyStat.created_date <= end_date.date())
+        .filter(or_(*area_stat_conditions))
+        .first()
+    )
+    sp, ss = (row[0] or 0.0), (row[1] or 0.0)
+    consumption_wh = (float(sp) / 4.0) if sp else 0.0
+    savings_wh = (float(ss) / 4.0) if ss else 0.0
+    return consumption_wh, savings_wh
+
+
+def _strategy_pie_from_strategy_mix_and_area_stats(
+    keypad_savings: float,
+    sensor_savings: float,
+    schedule_savings: float,
+    gui_savings: float,
+    total_trim: float,
+    stat_consumption_wh: float,
+    stat_savings_wh: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Mix weights from area_energy_saving_by_strategy row sums; Wh totals from
+    area_energy_stats (consumption + savings), /4 convention as area-group chart.
+    """
+    pool = keypad_savings + sensor_savings + schedule_savings + gui_savings + total_trim
+    total_wh = stat_consumption_wh + stat_savings_wh
+    if total_wh <= 0:
+        z = _empty_strategy_data()
+        return z, dict(z)
+
+    if pool > 0:
+        r = stat_savings_wh / pool
+        alloc_keypad = keypad_savings * r
+        alloc_sensor = sensor_savings * r
+        alloc_sched = schedule_savings * r
+        alloc_gui = gui_savings * r
+        alloc_tuning = total_trim * r
+    else:
+        alloc_keypad = alloc_sensor = alloc_sched = alloc_gui = 0.0
+        alloc_tuning = stat_savings_wh
+
+    values_wh = {
+        "Keypad": float(alloc_keypad),
+        "Sensors": float(alloc_sensor),
+        "Schedule": float(alloc_sched),
+        "GUI": float(alloc_gui),
+        "Tuning": float(alloc_tuning),
+        "Consumption": float(stat_consumption_wh),
+    }
+    data_pct = {k: round((values_wh[k] / total_wh) * 100, 2) for k in values_wh}
+    return data_pct, values_wh
+
+
+def _strategy_percentages_and_values_from_totals(
+    keypad_savings: float,
+    sensor_savings: float,
+    schedule_savings: float,
+    gui_savings: float,
+    total_consumption_wh: float,
+    total_trim: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Pie slice Wh = per-strategy savings + trim + consumption; full pie total_wh.
+
+    Strategy mix (consumption excluded from denominator) is P_i = s_i / savings_pool_wh
+    where savings_pool_wh = keypad + sensors + schedule + GUI + trim. The budget
+    (total_wh - consumption) equals savings_pool_wh, so allocated Wh per strategy
+    matches the row aggregates. Percentages are slice_wh / total_wh * 100.
+    """
+    savings_pool_wh = (
+        keypad_savings + sensor_savings + schedule_savings + gui_savings + total_trim
+    )
+    total_wh = savings_pool_wh + total_consumption_wh
+    if total_wh <= 0:
+        z = _empty_strategy_data()
+        return z, dict(z)
+
+    values_wh = {
+        "Keypad": float(keypad_savings),
+        "Sensors": float(sensor_savings),
+        "Schedule": float(schedule_savings),
+        "GUI": float(gui_savings),
+        "Tuning": float(total_trim),
+        "Consumption": float(total_consumption_wh),
+    }
+    data_pct = {
+        k: round((values_wh[k] / total_wh) * 100, 2) for k in values_wh
+    }
+    return data_pct, values_wh
+
+
+def _strategy_percentages_from_totals(
+    keypad_savings: float,
+    sensor_savings: float,
+    schedule_savings: float,
+    gui_savings: float,
+    total_consumption_wh: float,
+    total_trim: float,
+) -> Dict[str, Any]:
+    """Pie shares of (strategy savings + consumption + trim). Sums to 100% before rounding."""
+    pct, _ = _strategy_percentages_and_values_from_totals(
+        keypad_savings,
+        sensor_savings,
+        schedule_savings,
+        gui_savings,
+        total_consumption_wh,
+        total_trim,
+    )
+    return pct
+
+
 def get_saving_by_strategy(
     db: Session,
     area_ids: Optional[List[int]],
@@ -1629,11 +1768,11 @@ def get_saving_by_strategy(
         area_ids = [a.id for a in db.query(Area).all()]
 
     if not area_ids:
+        empty = _empty_strategy_data()
         return {
             "status": "success",
-            "data": _strategy_data_for_response(
-                {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-            ),
+            "data": _strategy_data_for_response(empty),
+            "values": _strategy_data_for_response(empty),
         }
 
     # ---------- Inclusive time range resolution ----------
@@ -1641,8 +1780,13 @@ def get_saving_by_strategy(
         start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     elif time_range == "this_week":
-        start_date = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = (start_date + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        # Align with get_total_consumption_by_area_id_optimized (Sunday-based week)
+        start_date = (now - timedelta(days=(now.weekday() + 1) % 7)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end_date = (start_date + timedelta(days=6)).replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
     elif time_range == "this_month":
         start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         last_day = calendar.monthrange(now.year, now.month)[1]
@@ -1662,8 +1806,7 @@ def get_saving_by_strategy(
     areas = db.query(Area.code, Area.processor_id).filter(Area.id.in_(area_ids)).all()
     if not areas:
         return {"status": "error", "message": "No valid areas found"}
-    
-    # Build composite key conditions for filtering
+
     area_conditions = [
         and_(
             AreaEnergySavingByStrategy.area_code == int(area_code),
@@ -1672,42 +1815,42 @@ def get_saving_by_strategy(
         for area_code, processor_id in areas
     ]
 
-    # ---------- Fetch energy strategy rows using composite key ----------
+    area_stat_conditions = [
+        and_(
+            AreaEnergyStat.area_code == int(area_code),
+            AreaEnergyStat.processor_id == processor_id
+        )
+        for area_code, processor_id in areas
+    ]
+
+    stat_consumption_wh, stat_savings_wh = _area_energy_stat_consumption_and_savings_wh(
+        db, area_stat_conditions, start_date, end_date
+    )
+
+    # ---------- Fetch energy strategy rows (mix weights only) ----------
     rows = (
         db.query(AreaEnergySavingByStrategy)
         .filter(
-            or_(*area_conditions),  # Use composite key filtering
+            or_(*area_conditions),
             AreaEnergySavingByStrategy.created_at >= start_date,
             AreaEnergySavingByStrategy.created_at <= end_date,
         )
         .all()
     )
 
-    if not rows:
-        return {
-            "status": "success",
-            "data": _strategy_data_for_response(
-                {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-            ),
-        }
-
-    # ---------- Totals ----------
-    total_savings_wh = 0
-    total_consumption_wh = 0
+    total_trim = 0.0
     keypad_savings = 0
     sensor_savings = 0
     schedule_savings = 0
     gui_savings = 0
 
     for row in rows:
+        total_trim += float(row.trim_savings or 0)
         saved = row.energy_saved_in_Wh or 0
         consumed = row.energy_consumed_in_Wh or 0
 
         if saved == 0 and consumed == 0:
             continue
-
-        total_savings_wh += saved
-        total_consumption_wh += consumed
 
         if row.strategy_type == "Keypad":
             keypad_savings += saved
@@ -1718,25 +1861,21 @@ def get_saving_by_strategy(
         elif row.strategy_type == "Sensors":
             sensor_savings += saved
 
-    total_energy_all = total_savings_wh + total_consumption_wh
-    if total_energy_all == 0:
-        return {
-            "status": "success",
-            "data": _strategy_data_for_response(
-                {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-            ),
-        }
+    data, values_wh = _strategy_pie_from_strategy_mix_and_area_stats(
+        keypad_savings,
+        sensor_savings,
+        schedule_savings,
+        gui_savings,
+        total_trim,
+        stat_consumption_wh,
+        stat_savings_wh,
+    )
 
-    # ---------- Percentages ----------
-    data = {
-        "Keypad": round((keypad_savings / total_energy_all) * 100, 2),
-        "Sensors": round((sensor_savings / total_energy_all) * 100, 2),
-        "Schedule": round((schedule_savings / total_energy_all) * 100, 2),
-        "GUI": round((gui_savings / total_energy_all) * 100, 2),
-        "Consumption": round((total_consumption_wh / total_energy_all) * 100, 2)
+    return {
+        "status": "success",
+        "data": _strategy_data_for_response(data),
+        "values": _strategy_data_for_response(values_wh),
     }
-
-    return {"status": "success", "data": _strategy_data_for_response(data)}
 
 def get_unified_energy_data_of_a_day(db: Session, area_ids, floor_ids, data_date):
     

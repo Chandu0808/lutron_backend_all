@@ -35,6 +35,7 @@ class AreaEnergySavingByStrategy(Base):
     time_elapsed_in_sec = Column(Integer, nullable=True)  # duration in seconds
     energy_consumed_in_Wh = Column(Float, nullable=True)
     energy_saved_in_Wh = Column(Float, nullable=True)
+    trim_savings = Column(Float, nullable=True)  # Wh: zone trim power × hours when row is closed (see listener)
     total_energy = Column(Float, nullable=True)  # sum of consumed + saved
     
     # Composite index for efficient queries by (area_code, processor_id)

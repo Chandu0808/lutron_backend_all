@@ -18,6 +18,7 @@ from app.models.events import CurrentAreaEvent
 from app.models.occupancy_logs import OccupancyLog
 from sqlalchemy import desc
 from app.utils.energy_unit_converter import convert_energy_dict, convert_single_energy_value
+from app.crud.energy_stats import get_saving_by_strategy
 
 
 DEFAULT_INTERVALS = 10  # Change to 12 if needed
@@ -1590,126 +1591,6 @@ def get_peak_min_occupancy(
         "peak": {"value": peak_value, "time": peak_time},
         "min": {"value": min_value, "time": min_time}
     }
-
-def get_saving_by_strategy(
-    db: Session,
-    area_ids: Optional[List[int]],
-    floor_ids: Optional[List[int]],
-    time_range: str,
-    start_date: datetime = None,
-    end_date: datetime = None
-) -> Dict[str, Any]:
-    now = datetime.now()
-
-    # ---------- Resolve area_ids from floor_ids if needed ----------
-    if not area_ids and floor_ids:
-        area_ids = [a.id for a in db.query(Area).filter(Area.floor_id.in_(floor_ids)).all()]
-    elif not area_ids:
-        area_ids = [a.id for a in db.query(Area).all()]
-
-    if not area_ids:
-        return {
-            "status": "success",
-            "data": {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-        }
-
-    # ---------- Inclusive time range resolution ----------
-    if time_range == "this_day":
-        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-    elif time_range == "this_week":
-        start_date = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = (start_date + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=999999)
-    elif time_range == "this_month":
-        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        last_day = calendar.monthrange(now.year, now.month)[1]
-        end_date = now.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
-    elif time_range == "this_year":
-        start_date = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        end_date = now.replace(month=12, day=31, hour=23, minute=59, second=59, microsecond=999999)
-    elif time_range == "custom":
-        if not (start_date and end_date):
-            raise ValueError("Custom range requires both start_date and end_date")
-        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-    else:
-        raise ValueError("Invalid time_range value")
-
-    # ---------- Get area codes and processor_ids (composite key) ----------
-    areas = db.query(Area.code, Area.processor_id).filter(Area.id.in_(area_ids)).all()
-    if not areas:
-        return {"status": "error", "message": "No valid areas found"}
-    
-    # Build composite key conditions for filtering
-    area_conditions = [
-        and_(
-            AreaEnergySavingByStrategy.area_code == int(area_code),
-            AreaEnergySavingByStrategy.processor_id == processor_id
-        )
-        for area_code, processor_id in areas
-    ]
-
-    # ---------- Fetch energy strategy rows using composite key ----------
-    rows = (
-        db.query(AreaEnergySavingByStrategy)
-        .filter(
-            or_(*area_conditions),  # Use composite key filtering
-            AreaEnergySavingByStrategy.created_at >= start_date,
-            AreaEnergySavingByStrategy.created_at <= end_date,
-        )
-        .all()
-    )
-
-    if not rows:
-        return {
-            "status": "success",
-            "data": {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-        }
-
-    # ---------- Totals ----------
-    total_savings_wh = 0
-    total_consumption_wh = 0
-    keypad_savings = 0
-    sensor_savings = 0
-    schedule_savings = 0
-    gui_savings = 0
-
-    for row in rows:
-        saved = row.energy_saved_in_Wh or 0
-        consumed = row.energy_consumed_in_Wh or 0
-
-        if saved == 0 and consumed == 0:
-            continue
-
-        total_savings_wh += saved
-        total_consumption_wh += consumed
-
-        if row.strategy_type == "Keypad":
-            keypad_savings += saved
-        elif row.strategy_type == "Schedule":
-            schedule_savings += saved
-        elif row.strategy_type == "GUI":
-            gui_savings += saved
-        elif row.strategy_type == "Sensors":
-            sensor_savings += saved
-
-    total_energy_all = total_savings_wh + total_consumption_wh
-    if total_energy_all == 0:
-        return {
-            "status": "success",
-            "data": {"Keypad": 0, "Sensors": 0, "Schedule": 0, "GUI": 0, "Consumption": 0}
-        }
-
-    # ---------- Percentages ----------
-    data = {
-        "Keypad": round((keypad_savings / total_energy_all) * 100, 2),
-        "Sensors": round((sensor_savings / total_energy_all) * 100, 2),
-        "Schedule": round((schedule_savings / total_energy_all) * 100, 2),
-        "GUI": round((gui_savings / total_energy_all) * 100, 2),
-        "Consumption": round((total_consumption_wh / total_energy_all) * 100, 2)
-    }
-
-    return {"status": "success", "data": data}
 
 def get_unified_energy_data_of_a_day(db: Session, area_ids, floor_ids, data_date):
     
