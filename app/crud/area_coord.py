@@ -87,13 +87,22 @@ def upload_area_coordinates(file: UploadFile, db: Session):
                     zone_name = zone.get("Name", f"Zone {zone_code}")
                     zone_type = zone.get("ControlType", "Unknown")
 
-                    existing_zone = db.query(Zone).filter_by(code=zone_code).first()
+                    existing_zone = db.query(Zone).filter_by(processor_id=processor_id, code=zone_code).first()
                     if existing_zone:
                         existing_zone.name = zone_name
                         existing_zone.type = zone_type
                         existing_zone.area_id = area_id
+                        existing_zone.processor_id = processor_id
                     else:
-                        db.add(Zone(code=zone_code, name=zone_name, type=zone_type, area_id=area_id))
+                        db.add(
+                            Zone(
+                                code=zone_code,
+                                name=zone_name,
+                                type=zone_type,
+                                area_id=area_id,
+                                processor_id=processor_id,
+                            )
+                        )
         except Exception:
             continue
         finally:

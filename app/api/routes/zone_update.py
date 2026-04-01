@@ -206,7 +206,14 @@ async def zone_update(
         # 3) Log GUI actions per-zone (before applying updates)
         for zone_cmd in payload.zones:
             # Lookup by Zone.code instead of Zone.id
-            zone = db.query(Zone).filter(Zone.code == str(zone_cmd.zone_id)).first()
+            zone = (
+                db.query(Zone)
+                .filter(
+                    Zone.code == str(zone_cmd.zone_id),
+                    Zone.processor_id == area.processor_id,
+                )
+                .first()
+            )
             if not zone:
                 zone_name = f"Zone {zone_cmd.zone_id} (not in DB)"
                 zone_type = (zone_cmd.zone_type or "").lower()

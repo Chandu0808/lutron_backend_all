@@ -36,6 +36,7 @@ from app.utils.activity_report_logger import activity_report_log
 from app.models.user_model import UserPermission
 from app.models.zone import Zone
 from app.utils.processor_trim import fetch_zone_trims_from_processor
+from app.crud.zone_sync import sync_zones_for_floor
 
 
 
@@ -49,6 +50,27 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def _energy_logger_manual_enabled() -> bool:
     value = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower()
     return value in ("true", "1", "yes")
+
+
+@router.post("/{floor_id}/sync-zones")
+def sync_zones_endpoint(
+    floor_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_operator_permission_for_scope(
+        required_level=2,
+        floor_ids=[floor_id],
+        enforce_on_empty_scope=True,
+        db=db,
+        current_user=current_user,
+    )
+
+    floor = db.query(Floor).filter(Floor.id == floor_id).first()
+    if not floor:
+        raise HTTPException(status_code=404, detail="Floor not found")
+
+    return sync_zones_for_floor(db, floor_id)
 
 
 def _sync_zone_trims_for_processor(db: Session, processor_id: int) -> None:
@@ -322,6 +344,13 @@ async def update_floor(
                 raise HTTPException(status_code=400, detail=f"Invalid 'processors' input: {str(e)}")
 
         db.commit()
+
+        # Best-effort: refresh area names + zones for this floor
+        # Keep floor update behavior unchanged if sync fails.
+        try:
+            sync_zones_for_floor(db, floor_id)
+        except Exception:
+            pass
 
         if not _energy_logger_manual_enabled():
             processor_ids = set()

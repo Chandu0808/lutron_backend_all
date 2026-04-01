@@ -18,3 +18,4 @@ pydantic[email]
 pandas
 openpyxl
 natsort
+pytest>=7.0.0

@@ -914,7 +914,7 @@ def check_zone_status(msg, db, processor_id):
     for zone in zone_statuses:
         href = zone.get("href")
         code = int(href.strip("/").split("/")[-2]) if href else None
-        zone_obj = db.query(Zone).filter_by(code=str(code)).first()
+        zone_obj = db.query(Zone).filter_by(processor_id=processor_id, code=str(code)).first()
 
         button_code, button_activity = get_button_info_for_event()
         if recent_button_event:

@@ -49,7 +49,10 @@ def log_activity_report_for_zone(db: Session, zone_event: ProcessorZoneEvent) ->
     """
     zone = None
     if zone_event.zone_code:
-        zone = db.query(Zone).filter(Zone.code == str(zone_event.zone_code)).first()
+        q = db.query(Zone).filter(Zone.code == str(zone_event.zone_code))
+        if getattr(zone_event, "processor_id", None) is not None:
+            q = q.filter(Zone.processor_id == zone_event.processor_id)
+        zone = q.first()
 
     desc = None
     activity_type = None
