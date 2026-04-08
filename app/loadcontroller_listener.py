@@ -547,13 +547,14 @@ def log_driver_alert_error(processor_id: int, loadcontroller_code: int, error_ty
 
 
 # ---------------------- Handle LoadController Status ---------------------- #
-async def handle_loadcontroller_status(statuses, processor_id, writer, reader, db):
+async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
     """Handle loadcontroller status updates with robust error handling"""
     
     # Log raw status data before processing
     # log_raw_loadcontroller_status_data(processor_id, statuses)
     
     for status in statuses:
+        db = SessionLocal()
         try:
             lc_href = status.get("href")
             if not lc_href:
@@ -799,9 +800,14 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader, d
             )
             # Continue processing other statuses even if one fails
             continue
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 # ---------------------- Unified Listener ---------------------- #
-async def loadcontroller_listener(reader, writer, db, processor_id):
+async def loadcontroller_listener(reader, writer, processor_id):
     async def send_ping():
         while not shutdown_event.is_set():
             await asyncio.sleep(30)
@@ -829,25 +835,24 @@ async def loadcontroller_listener(reader, writer, db, processor_id):
                 if url == "/server/status/ping":
                     continue
                 elif ctype == "SubscribeResponse" and "LoadControllerStatuses" in body:
-                    await handle_loadcontroller_status(body["LoadControllerStatuses"], processor_id, writer, reader, db)
+                    await handle_loadcontroller_status(body["LoadControllerStatuses"], processor_id, writer, reader)
                 elif url == "/loadcontroller/status":
-                    await handle_loadcontroller_status(body.get("LoadControllerStatuses", []), processor_id, writer, reader, db)
+                    await handle_loadcontroller_status(body.get("LoadControllerStatuses", []), processor_id, writer, reader)
         except asyncio.CancelledError:
             break
         except Exception:
             await asyncio.sleep(1)
 
 # ---------------------- Processor Handling ---------------------- #
-async def handle_connected_processor(processor, reader, writer, db):
+async def handle_connected_processor(processor, reader, writer):
     await _send_json(writer, {
         "CommuniqueType": "SubscribeRequest",
         "Header": {"Url": "/loadcontroller/status"}
     })
-    await loadcontroller_listener(reader, writer, db, processor.id)
+    await loadcontroller_listener(reader, writer, processor.id)
 
 async def monitor_loadcontroller(processor):
     """Monitor loadcontroller for a single processor - safe for multiple processes"""
-    db = SessionLocal()
     while not shutdown_event.is_set():
         try:
             # Get processor-specific certificate paths
@@ -864,15 +869,18 @@ async def monitor_loadcontroller(processor):
                 ssl=ctx,
                 server_hostname=get_proc_hostname(processor.system, processor.mac)
             )
-            await handle_connected_processor(processor, reader, writer, db)
+            await handle_connected_processor(processor, reader, writer)
         except asyncio.CancelledError:
             break
         except Exception:
+            db = SessionLocal()
             try:
                 db.add(ProcessorConnectionError(processor_id=processor.id, message="LoadController connection failed"))
                 db.commit()
             except Exception:
                 db.rollback()
+            finally:
+                db.close()
             await asyncio.sleep(5)
 
 # ---------------------- Entrypoint ---------------------- #
