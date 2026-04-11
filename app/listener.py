@@ -123,7 +123,7 @@ recent_button_event = None  # {"code": int, "activity": str, "age": int}
 
 # Processor-specific logger management
 processor_loggers = {}
-logs_dir = "logs"
+logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
 
 def get_processor_logger(processor_id):
     """Get or create a logger for a specific processor (console output only, file logging disabled)"""
@@ -276,14 +276,22 @@ async def discover_and_subscribe_buttons(reader: StreamReader, writer: StreamWri
 
 # ---------------------- Event Handlers ---------------------- #
 def log_keypad_or_listener_activity(db, area=None, zone=None, button_code=None, button_activity=None):
+    desc = None
+    act_type = None
+
     if button_code and button_activity:
+        # Keypad-triggered event
         if zone:
             desc = f"Switch state changed in zone {zone.name}"
             act_type = "Keypad"
         elif area:
             desc = "Change in scene of the area"
             act_type = "Keypad"
+        else:
+            # Button event without resolved zone/area; nothing to log safely.
+            return
     else:
+        # Listener-triggered event
         if zone:
             desc = f"Switch state changed in zone {zone.name}"
             act_type = "Zone Listener"
@@ -292,6 +300,9 @@ def log_keypad_or_listener_activity(db, area=None, zone=None, button_code=None, 
             act_type = "Area Listener"
         else:
             return
+
+    if not act_type or not desc:
+        return
     log_activity(
         db,
         area_id=area.id if area else (zone.area_id if zone else None),
@@ -620,7 +631,9 @@ def check_area_occupancy(msg, db, processor_id):
         has_zones = db.query(Zone).filter(Zone.area_id == (area.id if area else None)).first()
 
         resolved_area_name = ""
-        if area.floor:
+        if area is None:
+            resolved_area_name = f"Unknown Area ({code})"
+        elif area.floor:
             resolved_area_name = f"{area.floor.name} / {area.name}"
         else:
             resolved_area_name = area.name
@@ -734,6 +747,7 @@ def check_area_occupancy(msg, db, processor_id):
 
             # ---------- STEP 1: Validate Data Before Update ----------
             occupancy_status = area_status.get("OccupancyStatus")
+            manual_energy = _energy_logger_manual()
             
             # Validate occupancy: Only accept "Occupied" or "Unoccupied"
             should_update_occupancy = occupancy_status in ["Occupied", "Unoccupied"]
@@ -761,7 +775,7 @@ def check_area_occupancy(msg, db, processor_id):
             
             # Add power data only if max_power is valid (not NULL) and NOT manual mode
             # When energy_logger_manual is True, area power comes from zone rollup only
-            if should_update_power and not _energy_logger_manual():
+            if should_update_power and not manual_energy:
                 fields["instantaneous_power"] = instantaneous_power
                 fields["instantaneous_max_power"] = instantaneous_max_power
             
@@ -1198,6 +1212,8 @@ async def main_async():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        db.close()
 
 
 def listener_process_entrypoint():
