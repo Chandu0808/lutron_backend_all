@@ -1,8 +1,9 @@
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from app.models.area import Area
 from app.models.processor import Processor
 from app.models.events import CurrentAreaEvent
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from math import sqrt
 from itertools import groupby
 from app.models.coordinate import Coordinate
@@ -738,3 +739,123 @@ def sync_area_names_for_floor(
         "areas": updated_list,
         "errors": errors,
     }
+
+
+def parse_area_rename_leap_response(
+    resp: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[str], str]:
+    """
+    Interpret LEAP response after UpdateRequest to /area/{code}.
+
+    Returns:
+        (ok, processor_name_or_none, error_message)
+        error_message is empty when ok is True.
+    """
+    if resp is None:
+        return False, None, "No response from processor"
+
+    ctype = str(resp.get("CommuniqueType") or "")
+    if "ExceptionResponse" in ctype:
+        return False, None, f"Processor error: {resp}"
+
+    if "UpdateResponse" not in ctype:
+        return False, None, f"Unexpected CommuniqueType: {ctype or 'missing'}"
+
+    header = resp.get("Header") or {}
+    status_code = str(header.get("StatusCode") or "")
+    if status_code and status_code != "200 OK":
+        return False, None, f"Processor status: {status_code}"
+
+    body_area = (resp.get("Body") or {}).get("Area")
+    proc_name: Optional[str] = None
+    if isinstance(body_area, dict):
+        raw = body_area.get("Name")
+        if raw is not None:
+            proc_name = str(raw)
+
+    return True, proc_name, ""
+
+
+def update_area_name_on_processor_and_db(
+    db: Session, area_id: int, new_name: str
+) -> Dict[str, Any]:
+    """
+    Rename an area on the Lutron processor (LEAP UpdateRequest), then persist Area.name.
+
+    Loads area by area_id; uses area.code for LEAP and area.processor_id for the connection.
+    """
+    name_stripped = (new_name or "").strip()
+    if not name_stripped:
+        raise HTTPException(status_code=400, detail="Name must not be empty")
+
+    area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Area not found")
+
+    processor_id = area.processor_id
+    processor = db.query(Processor).filter(Processor.id == processor_id).first()
+    if not processor:
+        raise HTTPException(status_code=404, detail="Processor not found")
+
+    if not is_processor_reachable(processor.ipv4):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Processor {processor.ipv4} not reachable",
+        )
+
+    area_code = str(area.code) if area.code is not None else ""
+    if not area_code:
+        raise HTTPException(status_code=400, detail="Area has no LEAP code")
+
+    ssock = None
+    try:
+        ssock = connect_to_processor(
+            processor.ipv4,
+            processor.mac,
+            processor.system,
+            processor_ipv4=processor.ipv4,
+        )
+        if not ssock:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to connect to processor",
+            )
+
+        send_json(
+            ssock,
+            {
+                "CommuniqueType": "UpdateRequest",
+                "Header": {"Url": f"/area/{area_code}"},
+                "Body": {"Area": {"Name": name_stripped}},
+            },
+        )
+        resp = recv_json(ssock)
+        ok, proc_name, err = parse_area_rename_leap_response(resp)
+        if not ok:
+            raise HTTPException(status_code=502, detail=err)
+
+        final_name = proc_name if proc_name is not None else name_stripped
+        area.name = final_name
+        db.commit()
+        db.refresh(area)
+
+        return {
+            "status": "success",
+            "area_id": area.id,
+            "processor_id": processor_id,
+            "area_code": area_code,
+            "name": final_name,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"[Area rename] Error for area_id={area_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if ssock is not None:
+            try:
+                ssock.close()
+            except Exception:
+                pass

@@ -4,7 +4,8 @@ from app.api.routes import (
     full_area_status, home, dashboard_home, zone_update,
     area_group, schedule, area_tree, device, edit_scene,
     update_occupancy, quick_controls, zone,
-    energy_stats, help, activity_report, widget_title, alert, exports, reconciliation, settings
+    energy_stats, help, activity_report, widget_title, alert, exports, reconciliation, settings,
+    area_rename,
 )
 
 api_router = APIRouter()
@@ -20,6 +21,7 @@ api_router.include_router(dashboard_home.router, prefix="/home", tags=["Dashboar
 
 # -------------------- Area Related -------------------- #
 api_router.include_router(full_area_status.router, prefix="/area", tags=["Area"])
+api_router.include_router(area_rename.router, prefix="/area", tags=["Area"])
 api_router.include_router(zone_update.router, prefix="/area", tags=["Zone Update"])
 api_router.include_router(zone.router, prefix="/area", tags=["Zone List"])
 api_router.include_router(area_group.router, prefix="/area_group", tags=["Area group"])
