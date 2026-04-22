@@ -17,3 +17,14 @@ class ProcessorBase(BaseModel):
 class ProcessorOut(ProcessorBase):
     id: int
     server: str
+
+
+class ProcessorListAllOut(BaseModel):
+    id: int
+    ipv4: Optional[str] = None
+    system: Optional[str] = None
+    serial: Optional[str] = None
+    handshake_status: Optional[bool] = None
+
+    class Config:
+        from_attributes = True

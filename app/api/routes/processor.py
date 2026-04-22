@@ -1,17 +1,20 @@
 # app/api/routes/processor.py
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 from zeroconf import Zeroconf, ServiceBrowser
 from typing import List
 import time
 from datetime import datetime
+import ipaddress
+import subprocess
+import sys
 
 from app.dependencies.auth import get_current_user
 from app.database.session import SessionLocal
 from app.models.processor import Processor
-from app.schemas.processor import ProcessorOut
+from app.schemas.processor import ProcessorOut, ProcessorListAllOut
 from app.crud.processor import (
     MyListener, 
     ensure_processor_table,
@@ -31,6 +34,33 @@ from app.utils.json_connection import create_ssl_connection, send_json, recv_jso
 
 
 router = APIRouter()
+
+
+def _is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
+def _parse_ipv4(value: str) -> str:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid IPv4 address") from e
+    if not isinstance(ip, ipaddress.IPv4Address):
+        raise HTTPException(status_code=400, detail="Invalid IPv4 address")
+    return str(ip)
+
+
+def _spawn_windows_ping_terminal(ipv4: str) -> None:
+    """
+    Open a new interactive CMD window and run continuous ping.
+    Output is shown only in that window, not in the API response.
+    """
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    subprocess.Popen(
+        ["cmd.exe", "/c", "start", "cmd.exe", "/k", "ping", ipv4, "-t"],
+        creationflags=creationflags,
+        close_fds=True,
+    )
 
 
 # Dependency
@@ -162,6 +192,69 @@ def list_all_processors(
         raise HTTPException(status_code=503, detail="No processor available")
 
     return reachable_processors
+
+
+@router.get("/list_all", response_model=List[ProcessorListAllOut])
+def list_all_processors_rows(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> List[ProcessorListAllOut]:
+    """
+    Return all rows in the processor table (no discovery, no filtering).
+    """
+    return db.query(Processor).all()
+
+
+@router.post("/toggle_handshake_status")
+def toggle_handshake_status(
+    processor_id: int = Query(..., description="Processor ID to toggle handshake status"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    processor = db.query(Processor).filter(Processor.id == processor_id).first()
+    if not processor:
+        raise HTTPException(status_code=404, detail="Processor not found")
+
+    if processor.handshake_status is None:
+        raise HTTPException(status_code=400, detail="do handshake first to enable this")
+
+    processor.handshake_status = not processor.handshake_status
+    db.commit()
+    db.refresh(processor)
+
+    return {"processor_id": processor.id, "handshake_status": processor.handshake_status}
+
+
+@router.post("/ping_terminal", response_class=PlainTextResponse)
+def ping_terminal_popup(
+    processor_id: int = Query(..., description="Processor ID whose IPv4 will be pinged"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Windows only: opens a new CMD window running `ping <ipv4> -t`.
+    The HTTP response is plain text `ok` (no ping output in the response body).
+    """
+    if not _is_windows():
+        raise HTTPException(
+            status_code=501,
+            detail="Ping terminal popup is only supported when the API runs on Windows.",
+        )
+
+    processor = db.query(Processor).filter(Processor.id == processor_id).first()
+    if not processor:
+        raise HTTPException(status_code=404, detail="Processor not found")
+    if not processor.ipv4:
+        raise HTTPException(status_code=400, detail="Processor IPv4 address not available")
+
+    ipv4 = _parse_ipv4(processor.ipv4)
+
+    try:
+        _spawn_windows_ping_terminal(ipv4)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start ping window: {e}") from e
+
+    return "ok"
 
 
 @router.get("/leaf_areas", response_class=StreamingResponse)
