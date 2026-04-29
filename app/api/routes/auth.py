@@ -16,6 +16,8 @@ router = APIRouter()
 def login(login_request: LoginRequest, db: Session = Depends(get_db)):
     """
     Authenticate a user and return an access token.
+    ``username`` must match the user's stored ``name`` (unique among active users).
+    JWT ``sub`` remains the user's email for existing token resolution.
     Also log login activity.
     """
     user = authenticate_user(db, login_request.username, login_request.password)

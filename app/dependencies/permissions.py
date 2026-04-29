@@ -151,3 +151,24 @@ def can_create_role(creator_role: str, target_role: str) -> bool:
     c = _canon(creator_role)
     t = _canon(target_role)
     return t in _ALLOWED_CREATIONS.get(c, set())
+
+
+def can_manage_user_for_update(actor_role: str, target_role: str) -> bool:
+    """
+    Who may PATCH-update an existing user (email and role are immutable on that endpoint).
+
+    Mirrors creation reach: Superadmin may change Admin, Operator, or another Superadmin;
+    Admin may change Operator only; Operators cannot manage other users via this API.
+
+    Self-edit is allowed when the actor is permitted for the target role (e.g. Superadmin
+    editing own name/password). Role elevation is impossible because role is not accepted.
+    """
+    a = _canon(actor_role)
+    t = _canon(target_role)
+    if a == ROLE_OPERATOR:
+        return False
+    if a == ROLE_SUPERADMIN:
+        return True
+    if a == ROLE_ADMIN:
+        return t == ROLE_OPERATOR
+    return False

@@ -2,7 +2,7 @@
 from sqlalchemy.orm import Session, joinedload
 from app.models.user_model import User, UserPermission
 from app.core.security import get_password_hash, verify_password
-from app.schemas.user import UserCreate
+from app.schemas.user import UserCreate, UserUpdate
 from app.models.floor import Floor
 from app.dependencies.permissions import can_create_role 
 from app.models.area import Area 
@@ -20,6 +20,13 @@ def create_user(db: Session, user: UserCreate, created_by: User):
     ).first()
     if existing_active:
         raise Exception("user already exists")
+
+    existing_name = db.query(User).filter(
+        User.name == user.name,
+        User.is_active == True,
+    ).first()
+    if existing_name:
+        raise Exception("username already exists")
 
     # If user exists with is_active=False, allow creation (new user with same email)
     # Note: Multiple users can have same email, but only one should be active at a time
@@ -49,10 +56,10 @@ def create_user(db: Session, user: UserCreate, created_by: User):
 
     return db_user
 
-def authenticate_user(db: Session, email: str, password: str):
+def authenticate_user(db: Session, username: str, password: str):
     user = db.query(User).filter(
-        User.email == email,
-        User.is_active == True
+        User.name == username,
+        User.is_active == True,
     ).first()
     if user and verify_password(password, user.hashed_password):
         return user
@@ -80,6 +87,90 @@ def get_user_by_email(db: Session, email: str):
         )
         .first()
     )
+
+
+def get_active_user_by_id(db: Session, user_id: int):
+    return (
+        db.query(User)
+        .filter(User.id == user_id, User.is_active == True)
+        .options(
+            joinedload(User.user_permissions).joinedload(UserPermission.floor)
+        )
+        .first()
+    )
+
+
+def update_user(db: Session, user_id: int, payload: UserUpdate):
+    """
+    Apply partial updates for an active user. Role is not modified here.
+
+    When ``payload.name`` or ``payload.email`` is set to a new value, it must not
+    match another active user for that field.
+
+    When ``payload.permissions`` is set and the user is an Operator, existing
+    ``user_permissions`` rows are removed and replaced in one transaction.
+    """
+    user = get_active_user_by_id(db, user_id)
+    if not user:
+        return None
+
+    if payload.name is not None:
+        new_name = str(payload.name).strip()
+        if new_name != user.name:
+            existing_name = (
+                db.query(User)
+                .filter(
+                    User.name == new_name,
+                    User.is_active == True,
+                    User.id != user.id,
+                )
+                .first()
+            )
+            if existing_name:
+                raise ValueError("username already exists")
+        user.name = new_name
+    if payload.email is not None:
+        new_email = str(payload.email).strip()
+        if new_email != user.email:
+            existing_active = (
+                db.query(User)
+                .filter(
+                    User.email == new_email,
+                    User.is_active == True,
+                    User.id != user.id,
+                )
+                .first()
+            )
+            if existing_active:
+                raise ValueError("user already exists")
+            user.email = new_email
+    if payload.password is not None:
+        user.hashed_password = get_password_hash(payload.password)
+
+    if user.role == "Operator" and payload.permissions is not None:
+        floor_ids = {p.floor_id for p in payload.permissions}
+        if floor_ids:
+            rows = db.query(Floor.id).filter(Floor.id.in_(floor_ids)).all()
+            found_ids = {r[0] for r in rows}
+            if found_ids != floor_ids:
+                missing = floor_ids - found_ids
+                raise ValueError(f"invalid floor_id(s): {sorted(missing)}")
+
+        db.query(UserPermission).filter(UserPermission.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        for p in payload.permissions:
+            db.add(
+                UserPermission(
+                    user_id=user.id,
+                    floor_id=p.floor_id,
+                    permission_type=p.floor_permission,
+                )
+            )
+
+    db.commit()
+    db.refresh(user)
+    return get_active_user_by_id(db, user.id)
 
 
 def delete_user_by_id(db: Session, user_id: int):
