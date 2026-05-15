@@ -109,26 +109,40 @@ def _migrate_postgresql(engine) -> None:
             )
         )
 
-        # 5) Drop legacy unique on code (unknown name; drop any unique index on exactly (code))
+        # 5) Drop legacy unique on code (unknown name; drop any unique index on exactly (code)).
+        #    If the unique index is owned by a UNIQUE/PRIMARY KEY constraint (e.g. created
+        #    implicitly from Column(..., unique=True)), DROP INDEX is rejected by Postgres;
+        #    we must drop the constraint instead, which removes the backing index.
         conn.execute(
             text(
                 """
                 DO $$
                 DECLARE
                   idx record;
+                  con_name text;
                 BEGIN
                   FOR idx IN
-                    SELECT i.relname AS index_name
+                    SELECT i.relname AS index_name, x.indexrelid AS index_oid
                     FROM pg_index x
                     JOIN pg_class t ON t.oid = x.indrelid
                     JOIN pg_class i ON i.oid = x.indexrelid
                     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
                     WHERE t.relname = 'zones'
                       AND x.indisunique = true
-                    GROUP BY i.relname
-                    HAVING array_agg(a.attname ORDER BY a.attname) = ARRAY['code']
+                    GROUP BY i.relname, x.indexrelid
+                    HAVING array_agg(a.attname::text ORDER BY a.attname) = ARRAY['code']
                   LOOP
-                    EXECUTE format('DROP INDEX IF EXISTS %I', idx.index_name);
+                    SELECT c.conname INTO con_name
+                    FROM pg_constraint c
+                    WHERE c.conrelid = 'zones'::regclass
+                      AND c.contype IN ('u', 'p')
+                      AND c.conindid = idx.index_oid;
+
+                    IF con_name IS NOT NULL THEN
+                      EXECUTE format('ALTER TABLE zones DROP CONSTRAINT %I', con_name);
+                    ELSE
+                      EXECUTE format('DROP INDEX IF EXISTS %I', idx.index_name);
+                    END IF;
                   END LOOP;
                 END $$;
                 """
