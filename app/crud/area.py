@@ -71,6 +71,110 @@ def get_area_scene_summary_by_area_id(db: Session, area_id: int):
         logger.exception(f"[Scene Summary] Error for area {area_id}: {e}")
         return {"status": "error", "message": str(e)}
 
+def _lutron_zone_code_from_href(href: Optional[str]) -> Optional[int]:
+    """Parse Lutron zone code from a zone href (e.g. ``/zone/5/status``)."""
+    if not href or not isinstance(href, str):
+        return None
+    parts = [p for p in href.strip("/").split("/") if p]
+    if "zone" not in parts:
+        return None
+    idx = parts.index("zone")
+    if idx + 1 >= len(parts):
+        return None
+    try:
+        return int(parts[idx + 1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _fofp_status_from_level(level: int) -> Dict[str, Any]:
+    """Wire-format light fields for FOFP markers from a 0-100 level."""
+    if level <= 0:
+        return {"light_level": 0, "light_status": False}
+    return {"light_level": level, "light_status": True}
+
+
+def fetch_zone_light_levels_for_area(db: Session, area_id: int) -> Dict[int, Dict[str, Any]]:
+    """
+    Return per-zone light status for an area keyed by ``zones.id`` (DB primary key).
+
+    Uses the same LEAP endpoint as :func:`get_area_zones_with_status`
+    (``/area/{code}/associatedzone/status``). Never raises; returns ``{}`` on failure.
+    """
+    from app.models.zone import Zone
+
+    try:
+        area_id_int = int(area_id)
+    except (TypeError, ValueError):
+        return {}
+
+    area = db.query(Area).filter(Area.id == area_id_int).first()
+    if not area:
+        return {}
+
+    processor = db.query(Processor).filter(Processor.id == area.processor_id).first()
+    if not processor:
+        return {}
+
+    if not is_processor_reachable(processor.ipv4):
+        logger.warning(
+            "[FOFP Zone Status] Processor %s not reachable for area %s",
+            processor.ipv4,
+            area_id_int,
+        )
+        return {}
+
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        ssock = connect_to_processor(
+            processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+        )
+        send_json(
+            ssock,
+            {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area.code}/associatedzone/status"},
+            },
+        )
+        status_resp = recv_json(ssock)
+        status_zones = status_resp.get("Body", {}).get("ZoneStatuses", []) or []
+
+        for status in status_zones:
+            zone_href = (status.get("Zone") or {}).get("href", "")
+            lutron_code = _lutron_zone_code_from_href(zone_href)
+            if lutron_code is None:
+                continue
+            try:
+                level_raw = status.get("Level", 0)
+                level = max(0, min(100, int(round(float(level_raw)))))
+            except (TypeError, ValueError):
+                level = 0
+
+            zone_row = (
+                db.query(Zone)
+                .filter(Zone.area_id == area_id_int, Zone.code == str(lutron_code))
+                .first()
+            )
+            if zone_row is None:
+                zone_row = (
+                    db.query(Zone)
+                    .filter(
+                        Zone.processor_id == area.processor_id,
+                        Zone.code == str(lutron_code),
+                    )
+                    .first()
+                )
+            if zone_row is not None:
+                out[int(zone_row.id)] = _fofp_status_from_level(level)
+
+        ssock.close()
+    except Exception as exc:
+        logger.warning(
+            "[FOFP Zone Status] Live fetch failed for area %s: %s", area_id_int, exc
+        )
+    return out
+
+
 def get_area_zones_with_status(db: Session, area_id: int):
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:

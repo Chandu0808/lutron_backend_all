@@ -81,7 +81,20 @@ def apply_zone_metadata_for_area(
     )
     existing_by_code = {str(z.code): z for z in existing}
 
-    # Delete zones that are no longer associated with this area
+    # Delete zones that are no longer associated with this area.
+    # FOFP (Step 8): mark placements unavailable before delete so historical
+    # layout rows survive (zone_id becomes NULL via ON DELETE SET NULL).
+    zones_to_remove = [
+        z.id for code, z in existing_by_code.items() if code not in desired_by_code
+    ]
+    if zones_to_remove:
+        try:
+            from app.crud.fofp_health import mark_positions_for_zones_pending_removal
+
+            mark_positions_for_zones_pending_removal(db, zones_to_remove)
+        except Exception:
+            pass
+
     for code, z in existing_by_code.items():
         if code not in desired_by_code:
             db.delete(z)
@@ -240,6 +253,14 @@ def sync_zones_for_floor(db: Session, floor_id: int) -> dict[str, Any]:
 
     if result.status != "success" and result.areas_synced == 0:
         result.status = "error"
+
+    # FOFP incremental maintenance (Step 8) — fail-closed; never alters sync result.
+    try:
+        from app.crud.fofp_sync import run_fofp_post_sync_maintenance
+
+        run_fofp_post_sync_maintenance(db, floor_id)
+    except Exception:
+        pass
 
     return {
         "status": result.status,

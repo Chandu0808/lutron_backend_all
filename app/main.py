@@ -10,6 +10,7 @@ from app.models import *  # Ensure all models are loaded
 from app.api.api_router import api_router
 from app.theme_data import load_theme_defaults
 from app.database.migrate_zones_processor import ensure_zones_processor_scope
+from app.database.migrate_fofp_marker_stretch import ensure_fofp_marker_stretch_columns
 from app.utils.definitions import (
     LEAP_PRIVATE_KEY_FILE,
     LEAP_SIGNED_CSR_FILE,
@@ -48,6 +49,7 @@ async def on_startup():
     # -------------------- Database Initialization -------------------- #
     Base.metadata.create_all(bind=engine)
     ensure_zones_processor_scope(engine)
+    ensure_fofp_marker_stretch_columns(engine)
     load_theme_defaults()
 
     # ===== ENERGY LOGGER MODE (visible when running uvicorn) =====

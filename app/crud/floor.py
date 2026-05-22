@@ -17,6 +17,13 @@ from app.schemas.floor import (
     Unit,
 )
 
+from app.crud.fofp_settings import get_fofp_settings
+from app.crud.fofp_overlay import (
+    attach_live_status_to_positions,
+    get_overlay_positions_for_floor,
+    get_zone_live_status_for_fofp,
+)
+
 
 def area_coordinates_to_rings(coordinates: Any) -> List[List[dict]]:
     """
@@ -157,7 +164,8 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
             "floor_id": area.floor_id,
             "processor_id": area.processor_id,
             "co-ordinates": area_coordinates_to_rings(area.coordinates),
-            "light_status": None
+            "light_status": None,
+            "light_level": 0,
         }
         for area in areas
     }
@@ -188,6 +196,10 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
                 for area in processor_areas:
                     area_href = f"/area/{area.code}/status"
                     level = status_map.get(area_href, {}).get("Level")
+                    try:
+                        light_level = max(0, min(100, int(round(float(level)))))
+                    except (TypeError, ValueError):
+                        light_level = 0
 
                     if level == 0:
                         zone_status = "off"
@@ -198,6 +210,7 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
 
                     # Update the area status in results_dict
                     results_dict[area.id]["light_status"] = zone_status
+                    results_dict[area.id]["light_level"] = light_level
 
         except Exception as e:
             print(f"Processor {processor.ipv4} error: {e}")
@@ -206,7 +219,7 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
     # Convert dict values to list
     results = list(results_dict.values())
 
-    return {
+    response = {
         "status": "success",
         "floor_plan": floor.image_path,
         "boundary_values": {
@@ -221,6 +234,46 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
         "y_bottom": floor.y_bottom,
         "areas": results
     }
+
+    # Additive read-only FOFP overlay fields (Step 6).
+    #
+    # Strict safety contract:
+    # - This block must never alter any existing field above.
+    # - Any failure inside this block silently degrades to "FOFP disabled".
+    # - Empty positions when disabled, missing config, or any error path.
+    #
+    # The helpers themselves are non-raising; the outer guard is a belt-and-
+    # suspenders safety net so a regression here can never break the legacy
+    # light_status contract.
+    try:
+        fofp_cfg = get_fofp_settings(db)
+        fofp_enabled = bool(fofp_cfg.enabled)
+        fofp_positions: list = []
+
+        if fofp_enabled:
+            fofp_positions = get_overlay_positions_for_floor(db, floor_id)
+
+            # Step 7: zone-wise light_level per marker from current_zone_status only.
+            if fofp_positions:
+                try:
+                    status_by_zone = get_zone_live_status_for_fofp(db, fofp_positions)
+                    fofp_positions = attach_live_status_to_positions(
+                        fofp_positions, status_by_zone
+                    )
+                except Exception:
+                    fofp_positions = attach_live_status_to_positions(
+                        fofp_positions, {}
+                    )
+
+        response["fofp_enabled"] = fofp_enabled
+        response["fofp_config"] = fofp_cfg.as_response_dict()
+        response["fofp_positions"] = fofp_positions
+    except Exception:
+        response["fofp_enabled"] = False
+        response["fofp_config"] = {"shape": "circle", "marker_size": 5}
+        response["fofp_positions"] = []
+
+    return response
 
 
 

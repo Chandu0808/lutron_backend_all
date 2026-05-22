@@ -6,6 +6,7 @@ from app.api.routes import (
     update_occupancy, quick_controls, zone,
     energy_stats, help, activity_report, widget_title, alert, exports, reconciliation, settings,
     area_rename,
+    fofp,
 )
 
 api_router = APIRouter()
@@ -58,3 +59,6 @@ api_router.include_router(exports.router, prefix="/exports", tags=["Exports"])
 
 # -------------------- Reconciliation -------------------- #
 api_router.include_router(reconciliation.router, prefix="", tags=["Reconciliation"])
+
+# -------------------- FOFP (Floor Overlay / Floorplan Positioning) -------------------- #
+api_router.include_router(fofp.router, prefix="/fofp", tags=["FOFP"])

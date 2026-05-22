@@ -34,3 +34,5 @@ from .activity_report import ActivityReport
 from .home import HomePageContent
 from .widget_title import WidgetTitle
 from .alert_type_display_settings import AlertTypeDisplaySetting
+from .fofp import FOFPShape, ZoneFloorplanPosition
+from .fofp_settings import FOFPSettings
