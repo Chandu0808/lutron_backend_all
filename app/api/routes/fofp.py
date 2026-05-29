@@ -29,7 +29,10 @@ from app.crud.fofp_settings import (
     record_generation_result,
     update_fofp_config,
 )
-from app.crud.floor import area_coordinates_to_rings
+from app.crud.fofp_placement_validation import (
+    resolve_saved_marker_state,
+    validate_marker_geometry_for_area,
+)
 from app.database.session import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.permissions import require_operator_permission_for_scope
@@ -38,7 +41,6 @@ from app.models.floor import Floor
 from app.models.fofp import ZoneFloorplanPosition
 from app.models.user_model import User
 from app.models.zone import Zone
-from app.utils.floorplan_geometry import point_in_polygon
 from app.schemas.fofp import (
     FOFPConfigOut,
     FOFPConfigUpdate,
@@ -52,21 +54,6 @@ from app.schemas.fofp import (
 
 
 router = APIRouter()
-
-
-def _point_inside_area_geometry(area: Area, x: float, y: float) -> bool:
-    """Return True when (x, y) is inside any polygon ring for the area."""
-    try:
-        rings = area_coordinates_to_rings(area.coordinates)
-    except Exception:
-        return False
-    for ring in rings or []:
-        try:
-            if point_in_polygon((x, y), ring):
-                return True
-        except Exception:
-            continue
-    return False
 
 
 @router.get("/config", response_model=FOFPConfigOut)
@@ -224,6 +211,15 @@ def fofp_save_layout(
         for a in db.query(Area).filter(Area.id.in_(area_ids)).all()
     }
 
+    layout_defaults = get_fofp_config(db)
+
+    existing = {
+        row.zone_id: row
+        for row in db.query(ZoneFloorplanPosition)
+        .filter(ZoneFloorplanPosition.zone_id.in_(zone_ids))
+        .all()
+    }
+
     for entry in payload.positions:
         zone = zones_map.get(entry.zone_id)
         if zone is None:
@@ -251,23 +247,31 @@ def fofp_save_layout(
                     f"{entry.area_id}"
                 ),
             )
-        if not _point_inside_area_geometry(area, float(entry.x), float(entry.y)):
+        row = existing.get(entry.zone_id)
+        shape, hx, hy, _legacy = resolve_saved_marker_state(
+            entry_marker_shape=entry.marker_shape,
+            entry_shape_size=entry.shape_size,
+            entry_shape_size_x=entry.shape_size_x,
+            entry_shape_size_y=entry.shape_size_y,
+            existing_row=row,
+            layout_defaults=layout_defaults,
+        )
+        geom_error = validate_marker_geometry_for_area(
+            area,
+            float(entry.x),
+            float(entry.y),
+            shape,
+            hx,
+            hy,
+        )
+        if geom_error:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Position for zone {entry.zone_id} must remain inside "
-                    f"area {entry.area_id}"
+                    f"Zone {entry.zone_id} in area {entry.area_id}: {geom_error}"
                 ),
             )
 
-    existing = {
-        row.zone_id: row
-        for row in db.query(ZoneFloorplanPosition)
-        .filter(ZoneFloorplanPosition.zone_id.in_(zone_ids))
-        .all()
-    }
-
-    layout_defaults = get_fofp_config(db)
     default_shape = normalize_shape(layout_defaults.get("shape"))
     default_size = normalize_marker_size(layout_defaults.get("marker_size"))
 

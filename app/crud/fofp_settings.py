@@ -83,7 +83,17 @@ def normalize_shape(raw: Any) -> str:
     return DEFAULT_SHAPE
 
 
+def normalize_marker_size_min(raw: Any) -> int:
+    """Per-zone layout half-axis: minimum only (no global max cap)."""
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MARKER_SIZE
+    return max(MIN_MARKER_SIZE, size)
+
+
 def normalize_marker_size(raw: Any) -> int:
+    """Global config default marker_size (legacy 4–20 cap)."""
     try:
         size = int(raw)
     except (TypeError, ValueError):
@@ -100,14 +110,14 @@ def resolve_marker_half_axes(
     Return (half_x, half_y, legacy_shape_size).
     Missing x/y fall back to shape_size for backward compatibility.
     """
-    base = normalize_marker_size(shape_size)
+    base = normalize_marker_size_min(shape_size)
     half_x = (
-        normalize_marker_size(shape_size_x)
+        normalize_marker_size_min(shape_size_x)
         if shape_size_x is not None
         else base
     )
     half_y = (
-        normalize_marker_size(shape_size_y)
+        normalize_marker_size_min(shape_size_y)
         if shape_size_y is not None
         else base
     )

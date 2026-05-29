@@ -69,26 +69,26 @@ def distance_between_points(p1: Any, p2: Any) -> float:
     return math.hypot(x2 - x1, y2 - y1)
 
 
+def _is_point_on_segment(point: Point, a: Point, b: Point, eps: float = 1e-7) -> bool:
+    """True when ``point`` lies on closed segment ``a``–``b`` (matches frontend FOFP)."""
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    cross = (py - ay) * (bx - ax) - (px - ax) * (by - ay)
+    if abs(cross) > eps:
+        return False
+    dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay)
+    if dot < 0:
+        return False
+    len_sq = (bx - ax) ** 2 + (by - ay) ** 2
+    return dot <= len_sq
+
+
 def point_in_polygon(point: Any, polygon: Sequence[Any]) -> bool:
     """
     Test whether ``point`` lies inside ``polygon`` using ray casting.
 
-    The algorithm casts a horizontal ray from the test point in the +x
-    direction and counts edge crossings (Jordan curve theorem). It handles
-    concave polygons and an arbitrary number of vertices, and treats the
-    polygon as implicitly closed (the last vertex connects to the first).
-
-    Edge cases:
-      * ``polygon`` is empty or has fewer than 3 vertices -> returns ``False``.
-      * Points exactly on an edge are not guaranteed to return ``True`` or
-        ``False`` consistently; treat boundary behavior as undefined.
-
-    Args:
-        point: Test point.
-        polygon: Sequence of point-like vertices in order.
-
-    Returns:
-        True if the point is inside the polygon, otherwise False.
+    Points on an edge are treated as inside (parity with frontend FOFP).
     """
     if not polygon:
         return False
@@ -103,13 +103,13 @@ def point_in_polygon(point: Any, polygon: Sequence[Any]) -> bool:
 
     j = n - 1
     for i in range(n):
-        xi, yi = pts[i]
-        xj, yj = pts[j]
+        pi = pts[i]
+        pj = pts[j]
+        if _is_point_on_segment((px, py), pi, pj):
+            return True
+        xi, yi = pi
+        xj, yj = pj
 
-        # An edge crosses the horizontal ray when one endpoint is strictly
-        # above py and the other is at or below py (or vice versa). This
-        # exclusive condition also guarantees yj != yi, so the division
-        # below is safe.
         if (yi > py) != (yj > py):
             x_intersect = (xj - xi) * (py - yi) / (yj - yi) + xi
             if px < x_intersect:

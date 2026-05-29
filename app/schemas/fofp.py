@@ -68,9 +68,9 @@ class FOFPPositionIn(BaseModel):
     x: confloat(allow_inf_nan=False)
     y: confloat(allow_inf_nan=False)
     marker_shape: Optional[str] = None
-    shape_size: Optional[conint(ge=4, le=20)] = None
-    shape_size_x: Optional[conint(ge=4, le=20)] = None
-    shape_size_y: Optional[conint(ge=4, le=20)] = None
+    shape_size: Optional[conint(ge=4)] = None
+    shape_size_x: Optional[conint(ge=4)] = None
+    shape_size_y: Optional[conint(ge=4)] = None
 
 
 class FOFPSaveRequest(BaseModel):
