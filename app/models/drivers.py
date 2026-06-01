@@ -13,6 +13,7 @@ class Driver(Base):
     area_id = Column(Integer, nullable=True)        # FK to areas.id if needed
     area_code = Column(Integer, nullable=True)      # LEAP area code
     zone_code = Column(Integer, nullable=True)      # LEAP zone code
+    zone_id = Column(Integer, ForeignKey("zones.id", ondelete="SET NULL"), nullable=True)
     device_code = Column(Integer, nullable=True)    # Device href/code
     device_type = Column(String, nullable=True)     # e.g., keypad, dimmer, sensor
     loadcontroller_code = Column(Integer, nullable=True)

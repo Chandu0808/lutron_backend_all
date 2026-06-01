@@ -10,6 +10,7 @@ from app.models.processor import Processor
 from app.models.area import Area
 from app.models.events import ProcessorConnectionError
 from app.models.drivers import Driver
+from app.models.zone import Zone
 from app.utils.definitions import (
     get_proc_hostname,
     LAP_LUTRON_ROOT_FILE,
@@ -154,6 +155,17 @@ ERROR_MAP = {
     "DA": "UnitOverheatedOutputsOff",
     "DB": "MultipleError"
 }
+
+def _resolve_driver_zone_id(db, processor_id, zone_code):
+    if processor_id is None or zone_code is None:
+        return None
+    zone = (
+        db.query(Zone)
+        .filter(Zone.processor_id == processor_id, Zone.code == str(zone_code))
+        .first()
+    )
+    return zone.id if zone else None
+
 
 # ---------------------- Helper: Resolve LoadController Mapping with Full Job Retry ---------------------- #
 async def resolve_loadcontroller_mapping(writer, reader, loadcontroller_code, db, processor_id):
@@ -642,6 +654,10 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
                                     alert.area_code = area_code
                                 if zone_code and not alert.zone_code:
                                     alert.zone_code = zone_code
+                                if alert.zone_code and not alert.zone_id:
+                                    alert.zone_id = _resolve_driver_zone_id(
+                                        db, alert.processor_id, alert.zone_code
+                                    )
                                 if device_code and not alert.device_code:
                                     alert.device_code = device_code
                                 if device_type and not alert.device_type:
@@ -711,6 +727,7 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
                                 area_id=area_id,
                                 area_code=area_code,
                                 zone_code=zone_code,
+                                zone_id=_resolve_driver_zone_id(db, processor_id, zone_code),
                                 device_code=device_code,
                                 device_type=device_type,
                                 device_name=device_name,

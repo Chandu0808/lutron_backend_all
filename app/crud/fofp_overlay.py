@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.models.drivers import Driver
 from app.models.events import CurrentZoneEvent
 from app.models.fofp import ZoneFloorplanPosition
 from app.models.zone import Zone
@@ -375,6 +376,87 @@ def get_overlay_live_status_for_floor(
             aid, light_level_by_area, light_status_by_area
         )
     return out
+
+
+_DRIVER_ALERT_STATUSES = ("not_ok", "not_okay")
+FOFP_DRIVER_ALERT_COLOR = "red"
+
+
+def get_active_driver_alert_zone_ids(
+    db: Optional[Session], zone_ids: Iterable[int]
+) -> Set[int]:
+    """
+    Zone IDs (``zones.id``) with an active driver fault for FOFP highlighting.
+
+    Matches active-alerts rules: ``alert_status`` not ok, ``display`` true,
+    non-empty ``error_code``. Never raises.
+    """
+    if db is None:
+        return set()
+
+    safe_ids: List[int] = []
+    for zid in zone_ids or []:
+        try:
+            safe_ids.append(int(zid))
+        except (TypeError, ValueError):
+            continue
+    if not safe_ids:
+        return set()
+
+    try:
+        rows = (
+            db.query(Driver.zone_id)
+            .filter(
+                Driver.zone_id.in_(safe_ids),
+                Driver.alert_status.in_(_DRIVER_ALERT_STATUSES),
+                Driver.display.is_(True),
+                Driver.error_code.isnot(None),
+                Driver.error_code != "",
+            )
+            .distinct()
+            .all()
+        )
+        return {
+            int(row[0])
+            for row in rows or []
+            if row and row[0] is not None
+        }
+    except SQLAlchemyError as exc:
+        logger.warning("FOFP driver alert zone lookup failed: %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("FOFP driver alert zone lookup unexpected: %s", exc)
+    return set()
+
+
+def attach_driver_alerts_to_positions(
+    positions: List[Dict[str, Any]],
+    alert_zone_ids: Optional[Set[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Add ``driver_alert`` per FOFP marker. When true, clear dimming fields and set
+    ``alert_color`` so clients render solid red instead of 0–100 level styling.
+    """
+    alert_ids = alert_zone_ids if alert_zone_ids is not None else set()
+    enriched: List[Dict[str, Any]] = []
+    for pos in positions or []:
+        try:
+            zone_id = int(pos.get("zone_id")) if pos and pos.get("zone_id") is not None else None
+        except (TypeError, ValueError):
+            zone_id = None
+        is_alert = zone_id is not None and zone_id in alert_ids
+        item = {**pos, "driver_alert": is_alert}
+        if is_alert:
+            item["alert_color"] = FOFP_DRIVER_ALERT_COLOR
+            item["light_level"] = None
+            item["light_status"] = None
+        else:
+            item.pop("alert_color", None)
+        enriched.append(item)
+    return enriched
 
 
 def attach_live_status_to_positions(
