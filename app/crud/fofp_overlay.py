@@ -380,19 +380,23 @@ def get_overlay_live_status_for_floor(
 
 _DRIVER_ALERT_STATUSES = ("not_ok", "not_okay")
 FOFP_DRIVER_ALERT_COLOR = "red"
+FOFP_DRIVER_ERROR_TO_ALERT_TYPE = {
+    "E2": "Ballast Failure",
+    "FC": "Lamp Failure",
+}
 
 
-def get_active_driver_alert_zone_ids(
+def get_active_driver_alerts_by_zone(
     db: Optional[Session], zone_ids: Iterable[int]
-) -> Set[int]:
+) -> Dict[int, str]:
     """
-    Zone IDs (``zones.id``) with an active driver fault for FOFP highlighting.
+    Active FOFP driver alerts keyed by ``zones.id``.
 
-    Matches active-alerts rules: ``alert_status`` not ok, ``display`` true,
-    non-empty ``error_code``. Never raises.
+    Only Ballast Failure (E2) and Lamp Failure (FC). Matches active-alerts rules:
+    ``alert_status`` not ok, ``display`` true. Never raises.
     """
     if db is None:
-        return set()
+        return {}
 
     safe_ids: List[int] = []
     for zid in zone_ids or []:
@@ -401,26 +405,31 @@ def get_active_driver_alert_zone_ids(
         except (TypeError, ValueError):
             continue
     if not safe_ids:
-        return set()
+        return {}
 
     try:
         rows = (
-            db.query(Driver.zone_id)
+            db.query(Driver.zone_id, Driver.error_code)
             .filter(
                 Driver.zone_id.in_(safe_ids),
                 Driver.alert_status.in_(_DRIVER_ALERT_STATUSES),
                 Driver.display.is_(True),
-                Driver.error_code.isnot(None),
-                Driver.error_code != "",
+                Driver.error_code.in_(tuple(FOFP_DRIVER_ERROR_TO_ALERT_TYPE.keys())),
             )
-            .distinct()
             .all()
         )
-        return {
-            int(row[0])
-            for row in rows or []
-            if row and row[0] is not None
-        }
+        out: Dict[int, str] = {}
+        for row in rows or []:
+            if not row or row[0] is None:
+                continue
+            code = row[1]
+            alert_type = FOFP_DRIVER_ERROR_TO_ALERT_TYPE.get(code)
+            if not alert_type:
+                continue
+            zid = int(row[0])
+            if zid not in out:
+                out[zid] = alert_type
+        return out
     except SQLAlchemyError as exc:
         logger.warning("FOFP driver alert zone lookup failed: %s", exc)
         try:
@@ -429,31 +438,41 @@ def get_active_driver_alert_zone_ids(
             pass
     except Exception as exc:
         logger.warning("FOFP driver alert zone lookup unexpected: %s", exc)
-    return set()
+    return {}
+
+
+def get_active_driver_alert_zone_ids(
+    db: Optional[Session], zone_ids: Iterable[int]
+) -> Set[int]:
+    """Backward-compatible zone-id set for tests and callers that only need IDs."""
+    return set(get_active_driver_alerts_by_zone(db, zone_ids).keys())
 
 
 def attach_driver_alerts_to_positions(
     positions: List[Dict[str, Any]],
-    alert_zone_ids: Optional[Set[int]] = None,
+    alerts_by_zone: Optional[Mapping[int, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Add ``driver_alert`` per FOFP marker. When true, clear dimming fields and set
-    ``alert_color`` so clients render solid red instead of 0–100 level styling.
+    Add ``driver_alert`` and ``driver_alert_type`` per FOFP marker. When alerting,
+    clear dimming fields and set ``alert_color`` for solid red styling.
     """
-    alert_ids = alert_zone_ids if alert_zone_ids is not None else set()
+    alert_map = dict(alerts_by_zone) if alerts_by_zone is not None else {}
     enriched: List[Dict[str, Any]] = []
     for pos in positions or []:
         try:
             zone_id = int(pos.get("zone_id")) if pos and pos.get("zone_id") is not None else None
         except (TypeError, ValueError):
             zone_id = None
-        is_alert = zone_id is not None and zone_id in alert_ids
+        alert_type = alert_map.get(zone_id) if zone_id is not None else None
+        is_alert = alert_type is not None
         item = {**pos, "driver_alert": is_alert}
         if is_alert:
+            item["driver_alert_type"] = alert_type
             item["alert_color"] = FOFP_DRIVER_ALERT_COLOR
             item["light_level"] = None
             item["light_status"] = None
         else:
+            item.pop("driver_alert_type", None)
             item.pop("alert_color", None)
         enriched.append(item)
     return enriched

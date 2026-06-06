@@ -21,7 +21,7 @@ from app.crud.fofp_settings import get_fofp_settings
 from app.crud.fofp_overlay import (
     attach_driver_alerts_to_positions,
     attach_live_status_to_positions,
-    get_active_driver_alert_zone_ids,
+    get_active_driver_alerts_by_zone,
     get_overlay_positions_for_floor,
     get_zone_live_status_for_fofp,
 )
@@ -274,12 +274,12 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
                         for p in fofp_positions
                         if isinstance(p, dict) and p.get("zone_id") is not None
                     ]
-                    alert_zone_ids = get_active_driver_alert_zone_ids(db, zone_ids)
+                    alerts_by_zone = get_active_driver_alerts_by_zone(db, zone_ids)
                     fofp_positions = attach_driver_alerts_to_positions(
-                        fofp_positions, alert_zone_ids
+                        fofp_positions, alerts_by_zone
                     )
                 except Exception:
-                    fofp_positions = attach_driver_alerts_to_positions(fofp_positions, set())
+                    fofp_positions = attach_driver_alerts_to_positions(fofp_positions, {})
 
         response["fofp_enabled"] = fofp_enabled
         response["fofp_config"] = fofp_cfg.as_response_dict()
