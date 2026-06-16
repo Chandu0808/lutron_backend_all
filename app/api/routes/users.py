@@ -119,7 +119,7 @@ def list_users(db: Session = Depends(get_db)):
     }
 
 
-@router.patch("/{user_id}")
+@router.patch("/update")
 def patch_user(
     user_id: int,
     body: UserUpdate,
@@ -127,7 +127,7 @@ def patch_user(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Update an active user by id. ``role`` is immutable (reject if sent in JSON).
+    Update an active user by id (``user_id`` query parameter). ``role`` is immutable.
 
     ``name`` and ``email`` may be updated when provided (each unique among active users).
 
@@ -235,8 +235,8 @@ def legacy_put_user_by_email(
 ):
     """
     Legacy password update by email. Role changes are not supported; use admin workflows
-    or future role-specific APIs. Prefer ``PATCH /users/{user_id}`` for name, password,
-    and Operator permissions.
+    or future role-specific APIs. Prefer ``PATCH /users/update?user_id=`` for name,
+    password, and Operator permissions.
     """
     if role is not None:
         raise HTTPException(

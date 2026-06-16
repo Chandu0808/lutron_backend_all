@@ -7,11 +7,13 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.permissions import require_operator_permission_for_scope
+from app.crud.maintenance_report import generate_maintenance_report
 from app.models.processor import Processor
 from app.models.sensors_and_modules import SensorAndModule
 from app.models.drivers import Driver
 from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.models.user_model import User
+from app.schemas.maintenance import MaintenanceReportRequest
 
 router = APIRouter()
 
@@ -146,4 +148,33 @@ def alerts_display_status(
             for t in ordered_types
         ],
     }
+
+
+@router.post("/maintenance")
+def maintenance_report(
+    payload: MaintenanceReportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Fetch devices from all processors, filter by model-based type, and return a CSV report.
+    Continues when some processors are unreachable; fails only when none respond.
+    """
+    require_operator_permission_for_scope(
+        required_level=1,
+        area_ids=None,
+        floor_ids=None,
+        enforce_on_empty_scope=False,
+        db=db,
+        current_user=current_user,
+    )
+
+    result = generate_maintenance_report(db, payload.types)
+
+    if result["status"] == "error":
+        if result["message"] == "No processors configured":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=result)
+
+    return result
 

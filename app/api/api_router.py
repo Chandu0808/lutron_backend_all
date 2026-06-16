@@ -4,9 +4,12 @@ from app.api.routes import (
     full_area_status, home, dashboard_home, zone_update,
     area_group, schedule, area_tree, device, edit_scene,
     update_occupancy, quick_controls, zone,
-    energy_stats, help, activity_report, widget_title, alert, exports, reconciliation, settings,
+    energy_stats, help, activity_report, widget_title, dashboard_chart_order, alert, exports, reconciliation, settings,
     area_rename,
     fofp,
+    installation_config,
+    widget_configuration_api,
+    dashboard_layout_api,
 )
 
 api_router = APIRouter()
@@ -39,6 +42,7 @@ api_router.include_router(email_settings.router, prefix="/email", tags=["Email S
 
 # -------------------- Dashboard / Energy Stats -------------------- #
 api_router.include_router(energy_stats.router, prefix="/dashboard", tags=["Energy Stats"])
+api_router.include_router(dashboard_layout_api.router, prefix="/dashboard", tags=["Configuration"])
 api_router.include_router(help.router, prefix="/help", tags=["Help"])
 
 # -------------------- Activity Report -------------------- #
@@ -47,6 +51,11 @@ api_router.include_router(activity_report.router, prefix="/activity_report", tag
 # -------------------- Widget title -------------------- #
 
 api_router.include_router(widget_title.router, prefix="/widgets", tags=["Widget Titles"])
+api_router.include_router(dashboard_chart_order.router, prefix="/widgets", tags=["Widget Titles"])
+api_router.include_router(widget_configuration_api.router, prefix="/widgets", tags=["Configuration"])
+
+# -------------------- Configuration -------------------- #
+api_router.include_router(installation_config.router, prefix="/config", tags=["Configuration"])
 
 # -------------------- Alerts -------------------- #
 api_router.include_router(alert.router, prefix="/alert", tags=["Alerts"])

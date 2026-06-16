@@ -33,6 +33,10 @@ from .occupancy_logs import OccupancyLog
 from .activity_report import ActivityReport
 from .home import HomePageContent
 from .widget_title import WidgetTitle
+from .dashboard_chart_order import DashboardChartOrder
+from .installation_settings import InstallationSettings
+from .widget_configuration import WidgetConfiguration
+from .dashboard_layout import DashboardLayout
 from .alert_type_display_settings import AlertTypeDisplaySetting
 from .fofp import FOFPShape, ZoneFloorplanPosition
 from .fofp_settings import FOFPSettings

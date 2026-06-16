@@ -17,7 +17,7 @@ from app.models.user_model import User
 from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.area import Area
 from app.models.sensors_and_modules import SensorAndModule
-from app.models.widget_title import WidgetTitle
+from app.crud.widget_title import get_title_of_widget
 from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.dependencies.auth import get_current_user
@@ -461,12 +461,7 @@ def download_active_alerts_csv(
         writer = csv.writer(output)
 
         widget_key = "active_alerts"
-        widget_title = (
-            db.query(WidgetTitle.display_name)
-            .filter(WidgetTitle.widget_key == widget_key)
-            .scalar()
-            or "System Alerts"
-        )
+        widget_title = get_title_of_widget(db, widget_key) or "System Alerts"
 
         writer.writerow(["Title", widget_title])
         writer.writerow([f"{len(alerts)} active alerts requiring attention"])
@@ -514,12 +509,7 @@ def send_active_alerts_email(
         os.close(fd)
 
         widget_key = "active_alerts"
-        widget_title = (
-            db.query(WidgetTitle.display_name)
-            .filter(WidgetTitle.widget_key == widget_key)
-            .scalar()
-            or "System Alerts"
-        )
+        widget_title = get_title_of_widget(db, widget_key) or "System Alerts"
 
         with open(temp_path, "w", newline="") as f:
             writer = csv.writer(f)

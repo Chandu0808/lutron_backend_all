@@ -72,8 +72,6 @@ def sync_widget_defaults(
     return get_all_widget_titles(db)
 
 def get_title_of_widget(db: Session, widget_key: str):
-    widget_title = (
-        db.query(WidgetTitle.display_name)
-        .filter(WidgetTitle.widget_key == widget_key)
-    )
-    return widget_title.scalar() or None
+    from app.crud.widget_title_adapter import get_display_name_for_widget
+
+    return get_display_name_for_widget(db, widget_key)

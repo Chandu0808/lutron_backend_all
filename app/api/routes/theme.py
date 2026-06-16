@@ -1,15 +1,28 @@
 # routes/theme.py
 import os, random, shutil
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Optional
 from app.database.session import get_db
+from app.dependencies.auth import get_current_user
 from app.models.theme_model import Theme
-
+from app.models.user_model import User
 
 
 router = APIRouter()
+
+_THEME_EDITOR_ROLES = frozenset({"Admin", "Superadmin"})
+
+
+def require_theme_editor(current_user: User = Depends(get_current_user)) -> User:
+    """Restrict theme mutations to Superadmin and Admin."""
+    if current_user.role not in _THEME_EDITOR_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action is restricted to Admin and Superadmin only.",
+        )
+    return current_user
 
 @router.get("/")
 def get_theme(request: Request, db: Session = Depends(get_db)):
@@ -50,10 +63,52 @@ def get_background_image(request: Request, db: Session = Depends(get_db)):
 APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 UPLOAD_DIR = os.path.join(APP_DIR, "background_image")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+DEFAULT_BACKGROUND_IMAGE = "/background_image/defaultBg.png"
+THEME_BACKGROUND_KEY = "background_image"
+
+
+@router.post("/background_image_clear")
+def clear_background_image(
+    request: Request,
+    db: Session = Depends(get_db),
+    _editor: User = Depends(require_theme_editor),
+):
+    """Reset the application background image to the seeded default."""
+    theme_row = db.query(Theme).filter(Theme.key == THEME_BACKGROUND_KEY).first()
+    previous_value = theme_row.value if theme_row else None
+
+    if theme_row:
+        theme_row.value = DEFAULT_BACKGROUND_IMAGE
+    else:
+        theme_row = Theme(key=THEME_BACKGROUND_KEY, value=DEFAULT_BACKGROUND_IMAGE)
+        db.add(theme_row)
+
+    db.commit()
+    db.refresh(theme_row)
+
+    if previous_value and previous_value != DEFAULT_BACKGROUND_IMAGE:
+        uploaded_name = os.path.basename(previous_value)
+        if uploaded_name.startswith("bg_"):
+            uploaded_path = os.path.join(UPLOAD_DIR, uploaded_name)
+            if os.path.isfile(uploaded_path):
+                try:
+                    os.remove(uploaded_path)
+                except OSError:
+                    pass
+
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "status": "Updated",
+        "background_image": f"{base_url}{DEFAULT_BACKGROUND_IMAGE}",
+    }
+
+
 @router.post("/background")
 async def update_background_image_with_file(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _editor: User = Depends(require_theme_editor),
 ):
     try:
         ext = file.filename.split('.')[-1]
@@ -113,12 +168,16 @@ def get_application_theme(db: Session = Depends(get_db)):
 
 # --- POST: update theme color ---
 class ApplicationThemeUpdateRequest(BaseModel):
-    background: Optional[str]
-    content: Optional[str]
-    button: Optional[str]
+    background: Optional[str] = None
+    content: Optional[str] = None
+    button: Optional[str] = None
 
 @router.post("/application")
-def update_application_theme_bulk(update: ApplicationThemeUpdateRequest, db: Session = Depends(get_db)):
+def update_application_theme_bulk(
+    update: ApplicationThemeUpdateRequest,
+    db: Session = Depends(get_db),
+    _editor: User = Depends(require_theme_editor),
+):
     update_map = {
         "ui.background": update.background,
         "ui.content": update.content,
@@ -150,13 +209,17 @@ def update_application_theme_bulk(update: ApplicationThemeUpdateRequest, db: Ses
 
 
 class HeatmapBulkUpdateRequest(BaseModel):
-    light: Optional[str]
-    occupancy: Optional[str]
-    energy: Optional[str]
+    light: Optional[str] = None
+    occupancy: Optional[str] = None
+    energy: Optional[str] = None
 
 
 @router.post("/heatmap")
-def update_heatmap_theme_bulk(update: HeatmapBulkUpdateRequest, db: Session = Depends(get_db)):
+def update_heatmap_theme_bulk(
+    update: HeatmapBulkUpdateRequest,
+    db: Session = Depends(get_db),
+    _editor: User = Depends(require_theme_editor),
+):
     update_map = {
         "heatmap.light": update.light,
         "heatmap.occupancy": update.occupancy,

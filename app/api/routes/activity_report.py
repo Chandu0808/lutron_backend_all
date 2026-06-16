@@ -20,7 +20,7 @@ from app.crud.activity_report import (
 from app.dependencies.permissions import require_operator_permission_for_scope
 from app.dependencies.auth import get_current_user
 from app.models.user_model import User
-from app.models.widget_title import WidgetTitle
+from app.crud.widget_title import get_title_of_widget
 from app.crud import email_settings as email_crud
 
 router = APIRouter()
@@ -151,12 +151,7 @@ def download_activity_logs_csv(
     writer = csv.writer(output)
 
     widget_key = "activity_logs"
-    widget_title = (
-        db.query(WidgetTitle.display_name)
-        .filter(WidgetTitle.widget_key == widget_key)
-        .scalar()
-        or "Activity Logs"
-    )
+    widget_title = get_title_of_widget(db, widget_key) or "Activity Logs"
 
     writer.writerow(["Title", widget_title])
     writer.writerow([f"{len(logs)} activity log entries"])
@@ -220,12 +215,7 @@ def send_activity_logs_email(
     os.close(fd)
 
     widget_key = "activity_logs"
-    widget_title = (
-        db.query(WidgetTitle.display_name)
-        .filter(WidgetTitle.widget_key == widget_key)
-        .scalar()
-        or "Activity Logs"
-    )
+    widget_title = get_title_of_widget(db, widget_key) or "Activity Logs"
 
     with open(temp_path, "w", newline="") as f:
         writer = csv.writer(f)
