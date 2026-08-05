@@ -559,16 +559,24 @@ def log_driver_alert_error(processor_id: int, loadcontroller_code: int, error_ty
 
 
 # ---------------------- Handle LoadController Status ---------------------- #
-async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
-    """Handle loadcontroller status updates with robust error handling"""
-    
+async def handle_loadcontroller_status(
+    statuses, processor_id, writer, reader, *, full_snapshot: bool = False
+):
+    """Handle loadcontroller status updates with robust error handling.
+
+    full_snapshot=True only for SubscribeResponse / full ReadResponse inventory.
+    Partial UpdateResponse deltas must leave full_snapshot=False so missing LCs
+    are not treated as orphans.
+    """
+    status_list = list(statuses or [])
+
     # Log raw status data before processing
     # log_raw_loadcontroller_status_data(processor_id, statuses)
-    
-    for status in statuses:
+
+    for status in status_list:
         db = SessionLocal()
         try:
-            lc_href = status.get("href")
+            lc_href = status.get("href") if isinstance(status, dict) else None
             if not lc_href:
                 continue
                 
@@ -583,7 +591,7 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
 
             log_context = {'processor_id': processor_id, 'loadcontroller_code': loadcontroller_code}
 
-            error_info = status.get("ErrorStatus", {})
+            error_info = status.get("ErrorStatus", {}) if isinstance(status, dict) else {}
             if not isinstance(error_info, dict):
                 error_info = {}
                 
@@ -598,11 +606,21 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
             if code == "Unknown" or desc == "Unknown":
                 continue
 
-            # Find existing alert for this loadcontroller with processor context
-            alert = db.query(Driver).filter_by(
-                loadcontroller_code=loadcontroller_code, 
-                processor_id=processor_id
-            ).first()
+            # Prefer newest row; collapse duplicate active rows for same LC+processor
+            alert = (
+                db.query(Driver)
+                .filter_by(loadcontroller_code=loadcontroller_code, processor_id=processor_id)
+                .order_by(Driver.id.desc())
+                .first()
+            )
+            if alert is not None:
+                try:
+                    from app.crud.alert_reconciliation import dedupe_active_drivers_for_lc
+                    dedupe_active_drivers_for_lc(
+                        db, processor_id, loadcontroller_code, keep=alert
+                    )
+                except Exception:
+                    pass
 
             if is_error_resolved:
                 # Error has been resolved - update existing alert to "okay" status
@@ -701,25 +719,6 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
                                 writer, reader, loadcontroller_code, db, processor_id
                             )
                         
-                        # # Log missing data before creating alert
-                        # missing_fields = []
-                        # if not area_id:
-                        #     missing_fields.append("area_id")
-                        # if not area_code:
-                        #     missing_fields.append("area_code")
-                        # if not zone_code:
-                        #     missing_fields.append("zone_code")
-                        # if not device_code:
-                        #     missing_fields.append("device_code")
-                        # if not device_name:
-                        #     missing_fields.append("device_name")
-                        
-                        # if missing_fields:
-                        #     driver_alert_logger.warning(
-                        #         f"CREATING ALERT WITH MISSING DATA - Missing fields: {', '.join(missing_fields)}. "
-                        #         f"Error code: {code}, Description: {desc}",
-                        #         extra=log_context
-                        #     )
                         if area_id:
 
                             new_alert = Driver(
@@ -759,13 +758,6 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
                             }
                             # log_driver_alert_error(processor_id, loadcontroller_code, "missing_area_id", error_data)
 
-                        # Log alert creation with final status
-                        # if missing_fields:
-                        #     driver_alert_logger.warning(
-                        #         f"Alert created with missing data. Alert ID: {new_alert.id}, "
-                        #         f"Missing: {', '.join(missing_fields)}",
-                        #         extra=log_context
-                        #     )
                     except Exception as e:
                         error_data = {}
                         try:
@@ -823,6 +815,30 @@ async def handle_loadcontroller_status(statuses, processor_id, writer, reader):
             except Exception:
                 pass
 
+    # Full inventory only: clear orphan / healthy ghosts not present as live errors
+    if full_snapshot:
+        reconcile_db = SessionLocal()
+        try:
+            from app.crud.alert_reconciliation import reconcile_drivers_from_status_batch
+            reconcile_drivers_from_status_batch(
+                reconcile_db, processor_id, status_list, full_snapshot=True
+            )
+        except Exception as e:
+            driver_alert_logger.error(
+                f"Full-snapshot driver reconcile failed: {e}",
+                extra={"processor_id": processor_id},
+                exc_info=True,
+            )
+            try:
+                reconcile_db.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                reconcile_db.close()
+            except Exception:
+                pass
+
 # ---------------------- Unified Listener ---------------------- #
 async def loadcontroller_listener(reader, writer, processor_id):
     async def send_ping():
@@ -833,7 +849,23 @@ async def loadcontroller_listener(reader, writer, processor_id):
                 "Header": {"URL": "/server/status/ping"}
             })
 
+    async def periodic_status_read():
+        """Pull a full /loadcontroller/status inventory ~every 10 minutes."""
+        while not shutdown_event.is_set():
+            await asyncio.sleep(600)
+            try:
+                await _send_json(writer, {
+                    "CommuniqueType": "ReadRequest",
+                    "Header": {"Url": "/loadcontroller/status"},
+                })
+            except Exception as e:
+                driver_alert_logger.warning(
+                    f"Periodic loadcontroller status ReadRequest failed: {e}",
+                    extra={"processor_id": processor_id},
+                )
+
     asyncio.create_task(send_ping())
+    asyncio.create_task(periodic_status_read())
 
     while not shutdown_event.is_set():
         try:
@@ -852,9 +884,23 @@ async def loadcontroller_listener(reader, writer, processor_id):
                 if url == "/server/status/ping":
                     continue
                 elif ctype == "SubscribeResponse" and "LoadControllerStatuses" in body:
-                    await handle_loadcontroller_status(body["LoadControllerStatuses"], processor_id, writer, reader)
+                    await handle_loadcontroller_status(
+                        body["LoadControllerStatuses"],
+                        processor_id,
+                        writer,
+                        reader,
+                        full_snapshot=True,
+                    )
                 elif url == "/loadcontroller/status":
-                    await handle_loadcontroller_status(body.get("LoadControllerStatuses", []), processor_id, writer, reader)
+                    # Full inventory on Read/Subscribe; partial deltas must not orphan-clear
+                    is_full = ctype in ("ReadResponse", "SubscribeResponse")
+                    await handle_loadcontroller_status(
+                        body.get("LoadControllerStatuses", []),
+                        processor_id,
+                        writer,
+                        reader,
+                        full_snapshot=is_full,
+                    )
         except asyncio.CancelledError:
             break
         except Exception:

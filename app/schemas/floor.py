@@ -26,13 +26,34 @@ class FloorListOut(BaseModel):
     floor_name: str
     floor_image: str
     processors: List[ProcessorFloorOut]  # Use renamed model
+    sort_order: Optional[int] = None
 
     class Config:
         from_attributes = True
 
 
+class FloorListResponse(BaseModel):
+    manual_sort_enabled: bool = False
+    floors: List[FloorListOut]
 
 
+class FloorSortSettingsUpdate(BaseModel):
+    manual_sort_enabled: bool
+
+
+class FloorSortSettingsResponse(BaseModel):
+    manual_sort_enabled: bool
+    floors: List[FloorListOut]
+
+
+class FloorReorderRequest(BaseModel):
+    floor_ids: List[int]
+
+
+class FloorReorderResponse(BaseModel):
+    status: str = "success"
+    floors: List[FloorListOut]
+    manual_sort_enabled: bool = True
 
 
 class Operation(str, Enum):

@@ -24,6 +24,7 @@ from app.models.drivers import Driver
 from app.models.events import CurrentZoneEvent
 from app.models.fofp import ZoneFloorplanPosition
 from app.models.zone import Zone
+from app.crud.alert_reconciliation import active_driver_filter_clauses
 
 
 logger = logging.getLogger(__name__)
@@ -393,7 +394,7 @@ def get_active_driver_alerts_by_zone(
     Active FOFP driver alerts keyed by ``zones.id``.
 
     Only Ballast Failure (E2) and Lamp Failure (FC). Matches active-alerts rules:
-    ``alert_status`` not ok, ``display`` true. Never raises.
+    not_ok, display true, solved_time IS NULL, non-empty error_code. Never raises.
     """
     if db is None:
         return {}
@@ -412,8 +413,7 @@ def get_active_driver_alerts_by_zone(
             db.query(Driver.zone_id, Driver.error_code)
             .filter(
                 Driver.zone_id.in_(safe_ids),
-                Driver.alert_status.in_(_DRIVER_ALERT_STATUSES),
-                Driver.display.is_(True),
+                *active_driver_filter_clauses(),
                 Driver.error_code.in_(tuple(FOFP_DRIVER_ERROR_TO_ALERT_TYPE.keys())),
             )
             .all()

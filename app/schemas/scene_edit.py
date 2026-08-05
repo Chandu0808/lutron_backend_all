@@ -8,6 +8,7 @@ class WhiteTuningLevelModel(BaseModel):
 # Detail model for each zone in a scene
 class EditSceneDetail(BaseModel):
     zone_type: str  # "switched", "dimmed", or "whitetune"
+    assignment_href: Optional[str] = None
     SwitchedLevel: Optional[str] = None         # For switched zones
     Level: Optional[int] = None                 # Common to dimmed/whitetune
     FadeTime: Optional[str] = None              # Optional for dimmed/whitetune
@@ -28,6 +29,7 @@ class SceneStatusInput(BaseModel):
 # Output model for each assignment in scene status response
 class SceneAssignmentOut(BaseModel):
     assignment_href: str
+    zone_id: Optional[int] = None
     zone_type: str
     zone_name: str
     SwitchedLevel: Optional[str] = None

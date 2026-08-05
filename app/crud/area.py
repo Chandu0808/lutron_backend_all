@@ -2,12 +2,13 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from app.models.area import Area
 from app.models.processor import Processor
-from app.models.events import CurrentAreaEvent
+from app.models.events import CurrentAreaEvent, CurrentZoneEvent
 from typing import List, Dict, Any, Optional, Tuple
 from math import sqrt
 from itertools import groupby
 from app.models.coordinate import Coordinate
 from app.models.floor import Floor
+from app.models.zone import Zone
 from app.schemas.area import Point
 
 
@@ -15,6 +16,126 @@ from app.schemas.area import Point
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.logger import logger
+
+
+def _enrich_zone_from_level(zone_id, zone_name, zone_type, level, kelvin=None):
+    """Build the same zone wire object used by live LEAP enrichment."""
+    zone_type_l = (zone_type or "Unknown").lower()
+    try:
+        level_int = max(0, min(100, int(round(float(level))))) if level is not None else 0
+    except (TypeError, ValueError):
+        level_int = 0
+
+    zone_obj = {
+        "id": zone_id,
+        "name": zone_name or f"Zone {zone_id}",
+        "type": zone_type_l,
+    }
+
+    if zone_type_l == "switched":
+        zone_obj["level"] = level_int
+        zone_obj["status"] = "On" if level_int == 100 else "Off" if level_int == 0 else "INVALID"
+    elif zone_type_l == "dimmed":
+        zone_obj["brightness"] = f"{level_int}%"
+    elif zone_type_l == "whitetune":
+        zone_obj["brightness"] = f"{level_int}%"
+        if kelvin is not None:
+            zone_obj["temperature"] = f"{kelvin}K"
+    elif zone_type_l == "shade":
+        zone_obj["level"] = f"{level_int}%"
+    else:
+        zone_obj["brightness"] = f"{level_int}%"
+
+    return zone_obj
+
+
+def _zones_from_db_cache(db: Session, area_id: int, shade_only: bool = False):
+    """
+    Rebuild zone list from zones table + current_zone_status when LEAP fails.
+    Zone id matches live LEAP href id (zone code) when possible.
+    """
+    zones = db.query(Zone).filter(Zone.area_id == area_id).all()
+    if not zones:
+        return []
+
+    status_rows = (
+        db.query(CurrentZoneEvent)
+        .filter(CurrentZoneEvent.area_id == area_id)
+        .all()
+    )
+    by_zone_id = {r.zone_id: r for r in status_rows if r.zone_id is not None}
+    by_zone_code = {}
+    for r in status_rows:
+        if r.zone_code is not None:
+            try:
+                by_zone_code[int(r.zone_code)] = r
+            except (TypeError, ValueError):
+                continue
+
+    enriched = []
+    for z in zones:
+        ztype = (z.type or "").lower()
+        if shade_only and ztype != "shade":
+            continue
+
+        row = by_zone_id.get(z.id)
+        if row is None:
+            try:
+                row = by_zone_code.get(int(z.code))
+            except (TypeError, ValueError):
+                row = None
+
+        level = row.level if row else 0
+        kelvin = row.white_tuning_kelvin if row else None
+
+        try:
+            leap_id = int(z.code)
+        except (TypeError, ValueError):
+            leap_id = z.id
+
+        enriched.append(
+            _enrich_zone_from_level(leap_id, z.name, z.type, level, kelvin)
+        )
+
+    return enriched
+
+
+def _area_light_from_cache(db: Session, area_id: int):
+    """Return On/Off from cached non-shade zone levels, or None if unavailable."""
+    rows = (
+        db.query(CurrentZoneEvent.level, Zone.type)
+        .outerjoin(Zone, Zone.id == CurrentZoneEvent.zone_id)
+        .filter(CurrentZoneEvent.area_id == area_id)
+        .all()
+    )
+    valid = []
+    for level, zone_type in rows:
+        if zone_type and str(zone_type).lower() == "shade":
+            continue
+        try:
+            if level is None:
+                continue
+            valid.append(max(0, min(100, int(round(float(level))))))
+        except (TypeError, ValueError):
+            continue
+    if not valid:
+        return None
+    return "On" if max(valid) > 0 else "Off"
+
+
+def _area_occupancy_from_cache(db: Session, area_id: int):
+    event = (
+        db.query(CurrentAreaEvent)
+        .filter(CurrentAreaEvent.area_id == area_id)
+        .first()
+    )
+    if not event:
+        return None
+    occ = event.occupancy_status
+    if occ is None or occ == "Unknown":
+        return None
+    return occ
+
 
 def get_area_scene_summary_by_area_id(db: Session, area_id: int):
     area = db.query(Area).filter(Area.id == area_id).first()
@@ -187,8 +308,8 @@ def get_area_zones_with_status(db: Session, area_id: int):
         return {"status": "error", "message": "Processor not found"}
 
     if not is_processor_reachable(processor.ipv4):
-        logger.warning(f"[Zone Status] Processor {processor.ipv4} not reachable")
-        return {"status": "error", "message": f"Processor {processor.ipv4} not reachable"}
+        logger.warning(f"[Zone Status] Processor {processor.ipv4} not reachable; using cache")
+        return {"status": "success", "zones": _zones_from_db_cache(db, area_id)}
 
     try:
         ssock = connect_to_processor(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
@@ -199,6 +320,11 @@ def get_area_zones_with_status(db: Session, area_id: int):
             "Header": {"Url": f"/area/{area.code}/associatedzone"}
         })
         metadata_resp = recv_json(ssock)
+        if not isinstance(metadata_resp, dict):
+            ssock.close()
+            logger.warning(f"[Zone Status] Empty LEAP metadata for area {area_id}; using cache")
+            return {"status": "success", "zones": _zones_from_db_cache(db, area_id)}
+
         metadata_zones = metadata_resp.get("Body", {}).get("Zones", [])
         zone_meta_map = {}
         for zone in metadata_zones:
@@ -214,6 +340,11 @@ def get_area_zones_with_status(db: Session, area_id: int):
             "Header": {"Url": f"/area/{area.code}/associatedzone/status"}
         })
         status_resp = recv_json(ssock)
+        if not isinstance(status_resp, dict):
+            ssock.close()
+            logger.warning(f"[Zone Status] Empty LEAP status for area {area_id}; using cache")
+            return {"status": "success", "zones": _zones_from_db_cache(db, area_id)}
+
         status_zones = status_resp.get("Body", {}).get("ZoneStatuses", [])
 
         enriched_zones = []
@@ -223,50 +354,35 @@ def get_area_zones_with_status(db: Session, area_id: int):
             level = status.get("Level", 0)
 
             meta = zone_meta_map.get(zone_id, {})
-            zone_type = meta.get("type", "Unknown").lower()
+            zone_type = meta.get("type", "Unknown")
             zone_name = meta.get("name", f"Zone {zone_id}")
+            kelvin = status.get("ColorTuningStatus", {}).get("WhiteTuningLevel", {}).get("Kelvin")
 
-            zone_obj = {
-                "id": zone_id,
-                "name": zone_name,
-                "type": zone_type
-            }
-
-            if zone_type == "switched":
-                zone_obj["level"] = level
-                zone_obj["status"] = "On" if level == 100 else "Off" if level == 0 else "INVALID"
-
-            elif zone_type == "dimmed":
-                zone_obj["brightness"] = f"{level}%"
-
-            elif zone_type == "whitetune":
-                zone_obj["brightness"] = f"{level}%"
-                kelvin = status.get("ColorTuningStatus", {}).get("WhiteTuningLevel", {}).get("Kelvin")
-                if kelvin:
-                    zone_obj["temperature"] = f"{kelvin}K"
-
-            elif zone_type == "shade":
-                zone_obj["level"] = f"{level}%"
-
-            else:
-                zone_obj["brightness"] = f"{level}%"  # fallback
-
-            enriched_zones.append(zone_obj)
+            enriched_zones.append(
+                _enrich_zone_from_level(zone_id, zone_name, zone_type, level, kelvin)
+            )
 
         ssock.close()
         return {"status": "success", "zones": enriched_zones}
 
     except Exception as e:
-        logger.exception(f"[Zone Status] Error for area {area_id}: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.exception(f"[Zone Status] Error for area {area_id}: {e}; using cache")
+        return {"status": "success", "zones": _zones_from_db_cache(db, area_id)}
 
 
 def get_area_light_status(db: Session, area_id: int):
     area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        return {"status": "error", "message": "Area not found"}
     processor = db.query(Processor).filter(Processor.id == area.processor_id).first()
+    if not processor:
+        return {"status": "error", "message": "Processor not found"}
 
     if not is_processor_reachable(processor.ipv4):
-        logger.warning(f"[Light Status] Processor {processor.ipv4} not reachable")
+        logger.warning(f"[Light Status] Processor {processor.ipv4} not reachable; using cache")
+        cached = _area_light_from_cache(db, area_id)
+        if cached is not None:
+            return {"status": "success", "light_status": cached}
         return {"status": "error", "message": "Processor not reachable"}
 
     try:
@@ -278,21 +394,37 @@ def get_area_light_status(db: Session, area_id: int):
         })
         response = recv_json(ssock)
         ssock.close()
+
+        if not isinstance(response, dict):
+            cached = _area_light_from_cache(db, area_id)
+            if cached is not None:
+                return {"status": "success", "light_status": cached}
+            return {"status": "error", "message": "Empty LEAP response"}
 
         level = response.get("Body", {}).get("AreaStatus", {}).get("Level", 0)
         return {"status": "success", "light_status": "On" if level > 0 else "Off"}
 
     except Exception as e:
-        logger.exception(f"[Light Status] Error for area {area_id}: {e}")
+        logger.exception(f"[Light Status] Error for area {area_id}: {e}; using cache")
+        cached = _area_light_from_cache(db, area_id)
+        if cached is not None:
+            return {"status": "success", "light_status": cached}
         return {"status": "error", "message": str(e)}
 
 
 def get_area_occupancy_status(db: Session, area_id: int):
     area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        return {"status": "error", "message": "Area not found"}
     processor = db.query(Processor).filter(Processor.id == area.processor_id).first()
+    if not processor:
+        return {"status": "error", "message": "Processor not found"}
 
     if not is_processor_reachable(processor.ipv4):
-        logger.warning(f"[Occupancy] Processor {processor.ipv4} not reachable")
+        logger.warning(f"[Occupancy] Processor {processor.ipv4} not reachable; using cache")
+        cached = _area_occupancy_from_cache(db, area_id)
+        if cached is not None:
+            return {"status": "success", "occupancy_status": cached}
         return {"status": "error", "message": "Processor not reachable"}
 
     try:
@@ -305,11 +437,20 @@ def get_area_occupancy_status(db: Session, area_id: int):
         response = recv_json(ssock)
         ssock.close()
 
+        if not isinstance(response, dict):
+            cached = _area_occupancy_from_cache(db, area_id)
+            if cached is not None:
+                return {"status": "success", "occupancy_status": cached}
+            return {"status": "error", "message": "Empty LEAP response"}
+
         occ_status = response.get("Body", {}).get("AreaStatus", {}).get("OccupancyStatus", "Unknown")
         return {"status": "success", "occupancy_status": occ_status}
 
     except Exception as e:
-        logger.exception(f"[Occupancy] Error for area {area_id}: {e}")
+        logger.exception(f"[Occupancy] Error for area {area_id}: {e}; using cache")
+        cached = _area_occupancy_from_cache(db, area_id)
+        if cached is not None:
+            return {"status": "success", "occupancy_status": cached}
         return {"status": "error", "message": str(e)}
 
 def get_area_energy_status(db: Session, area_id: int):
@@ -578,8 +719,8 @@ def get_shade_zones_by_area(db: Session, area_id: int):
         raise Exception("Processor not found")
 
     if not is_processor_reachable(processor.ipv4):
-        logger.warning(f"[Shade Zones] Processor {processor.ipv4} not reachable")
-        raise Exception(f"Processor {processor.ipv4} not reachable")
+        logger.warning(f"[Shade Zones] Processor {processor.ipv4} not reachable; using cache")
+        return {"status": "success", "zones": _zones_from_db_cache(db, area_id, shade_only=True)}
 
     try:
         ssock = connect_to_processor(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
@@ -590,6 +731,11 @@ def get_shade_zones_by_area(db: Session, area_id: int):
             "Header": {"Url": f"/area/{area.code}/associatedzone"}
         })
         metadata_resp = recv_json(ssock)
+        if not isinstance(metadata_resp, dict):
+            ssock.close()
+            logger.warning(f"[Shade Zones] Empty LEAP metadata for area {area_id}; using cache")
+            return {"status": "success", "zones": _zones_from_db_cache(db, area_id, shade_only=True)}
+
         metadata_zones = metadata_resp.get("Body", {}).get("Zones", [])
         zone_meta_map = {
             int(zone["href"].split("/")[-1]): {
@@ -605,6 +751,11 @@ def get_shade_zones_by_area(db: Session, area_id: int):
             "Header": {"Url": f"/area/{area.code}/associatedzone/status"}
         })
         status_resp = recv_json(ssock)
+        if not isinstance(status_resp, dict):
+            ssock.close()
+            logger.warning(f"[Shade Zones] Empty LEAP status for area {area_id}; using cache")
+            return {"status": "success", "zones": _zones_from_db_cache(db, area_id, shade_only=True)}
+
         status_zones = status_resp.get("Body", {}).get("ZoneStatuses", [])
 
         shade_zones = []
@@ -629,8 +780,8 @@ def get_shade_zones_by_area(db: Session, area_id: int):
         return {"status": "success", "zones": shade_zones}
 
     except Exception as e:
-        logger.exception(f"[Shade Zones] Error for area {area_id}: {e}")
-        raise
+        logger.exception(f"[Shade Zones] Error for area {area_id}: {e}; using cache")
+        return {"status": "success", "zones": _zones_from_db_cache(db, area_id, shade_only=True)}
 
 
 

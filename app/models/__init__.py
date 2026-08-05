@@ -37,6 +37,9 @@ from .dashboard_chart_order import DashboardChartOrder
 from .installation_settings import InstallationSettings
 from .widget_configuration import WidgetConfiguration
 from .dashboard_layout import DashboardLayout
+from .variant_widget_configuration import VariantWidgetConfiguration
+from .variant_dashboard_layout import VariantDashboardLayout
+from .variant_theme_setting import VariantThemeSetting
 from .alert_type_display_settings import AlertTypeDisplaySetting
 from .fofp import FOFPShape, ZoneFloorplanPosition
 from .fofp_settings import FOFPSettings

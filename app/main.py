@@ -14,6 +14,11 @@ from app.database.migrate_fofp_marker_stretch import ensure_fofp_marker_stretch_
 from app.database.migrate_drivers_zone_id import ensure_drivers_zone_id
 from app.database.migrate_central_config import ensure_central_config_tables
 from app.database.migrate_widget_titles_to_configuration import ensure_widget_title_configuration
+from app.database.migrate_floor_sort_order import ensure_floor_sort_order_column
+from app.database.migrate_variant_config import (
+    ensure_variant_config_tables,
+    seed_variant_config_defaults,
+)
 from app.utils.definitions import (
     LEAP_PRIVATE_KEY_FILE,
     LEAP_SIGNED_CSR_FILE,
@@ -55,8 +60,11 @@ async def on_startup():
     ensure_fofp_marker_stretch_columns(engine)
     ensure_drivers_zone_id(engine)
     ensure_central_config_tables(engine)
+    ensure_variant_config_tables(engine)
     ensure_widget_title_configuration(engine)
+    ensure_floor_sort_order_column(engine)
     load_theme_defaults()
+    seed_variant_config_defaults()
 
     # ===== ENERGY LOGGER MODE (visible when running uvicorn) =====
     if _energy_logger_manual():

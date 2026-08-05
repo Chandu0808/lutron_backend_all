@@ -10,7 +10,7 @@ from pydantic import BaseModel,ValidationError
 
 
 
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query,Path,Body
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query,Path,Body, status
 from sqlalchemy.orm import Session
 
 from app.dependencies.auth import get_current_user
@@ -21,14 +21,32 @@ from app.models.floor import Floor
 from app.models.processor import Processor
 from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.user_model import User
-from app.schemas.floor import FloorListOut,ModifyCoordinatesRequest, ModifyCoordinatesResponse
+from app.schemas.floor import (
+    FloorListOut,
+    FloorListResponse,
+    FloorSortSettingsUpdate,
+    FloorSortSettingsResponse,
+    FloorReorderRequest,
+    FloorReorderResponse,
+    ModifyCoordinatesRequest,
+    ModifyCoordinatesResponse,
+)
+from app.crud.floor_sort import (
+    get_manual_sort_enabled,
+    set_manual_sort_enabled,
+    sort_floor_dicts,
+    reorder_floors,
+)
 from app.crud.floor import (
     create_floor, get_area_light_status_by_floor,
     get_area_occupancy_status_by_floor, get_area_energy_status_by_floor,
     modify_coordinates_in_db, generate_and_save_area_tree, update_floor_boundaries
 )
 from app.crud.occupancy_logs import track_floor_occupancy_logs
-from app.crud.floor_proc_mapping import create_floor_proc_mapping
+from app.crud.floor_proc_mapping import (
+    create_floor_proc_mapping,
+    ensure_floor_processor_mappings_from_areas,
+)
 from app.crud.area_tree import get_area_tree_by_floor
 from app.utils.activity_logger import log_activity 
 from app.dependencies.permissions import require_operator_permission_for_scope
@@ -141,9 +159,74 @@ class FloorListOut(BaseModel):
     floor_name: str
     floor_image: Optional[str]
     processors: List[dict]
+    sort_order: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+
+def _processors_for_floor(db: Session, floor_id: int) -> List[dict]:
+    ensure_floor_processor_mappings_from_areas(db, floor_id)
+    mappings = db.query(FloorProcMapping).filter(FloorProcMapping.floor_id == floor_id).all()
+    processors = []
+    for mapping in mappings:
+        processor = db.query(Processor).filter(Processor.id == mapping.processor_id).first()
+        if processor:
+            areas = db.query(Area).filter(
+                Area.processor_id == processor.id,
+                Area.floor_id == floor_id,
+            ).all()
+            processors.append({
+                "processor_id": processor.id,
+                "server": processor.server,
+                "areas": [{"area_id": a.id, "name": a.name} for a in areas],
+            })
+    return processors
+
+
+def _floor_to_dict(floor: Floor, processors: List[dict]) -> dict:
+    return {
+        "id": floor.id,
+        "floor_name": floor.name,
+        "floor_image": floor.image_path,
+        "processors": processors,
+        "sort_order": floor.sort_order,
+    }
+
+
+def _build_accessible_floor_list(db: Session, current_user: User) -> List[dict]:
+    floors = db.query(Floor).all()
+    response = []
+
+    for floor in floors:
+        try:
+            require_operator_permission_for_scope(
+                required_level=1,
+                floor_ids=[floor.id],
+                enforce_on_empty_scope=True,
+                db=db,
+                current_user=current_user,
+            )
+        except HTTPException as e:
+            if e.status_code == 403:
+                continue
+            raise
+
+        response.append(_floor_to_dict(floor, _processors_for_floor(db, floor.id)))
+
+    return response
+
+
+def _floor_list_response(db: Session, current_user: User) -> dict:
+    floors = _build_accessible_floor_list(db, current_user)
+    # Persist any repaired floor↔processor mappings from the loop above
+    db.commit()
+    manual_sort_enabled = get_manual_sort_enabled(db)
+    floors = sort_floor_dicts(floors, manual_sort_enabled)
+    return {
+        "manual_sort_enabled": manual_sort_enabled,
+        "floors": floors,
+    }
 
 
 @router.post("/create", response_model=FloorListOut)
@@ -174,24 +257,41 @@ async def upload_floor(
         db_floor = create_floor(db, name=request.floor_name, image_path=image_path)
 
         updated_areas = []
-        processor_data = []
+        processor_ids_to_map = set()
+        areas_by_processor = {}
 
         for mapping in request.processors:
-            create_floor_proc_mapping(db, floor_id=db_floor.id, processor_id=mapping.processor_id)
-            proc = db.query(Processor).filter(Processor.id == mapping.processor_id).first()
-
-            proc_areas = []
-            for aid in mapping.area_ids:
+            processor_ids_to_map.add(int(mapping.processor_id))
+            for aid in mapping.area_ids or []:
                 area = db.query(Area).filter(Area.id == aid).first()
                 if area:
                     area.floor_id = db_floor.id
                     updated_areas.append(area)
-                    proc_areas.append(area)
+                    # Use the area's real processor_id (CSV source of truth)
+                    actual_pid = int(area.processor_id) if area.processor_id is not None else int(mapping.processor_id)
+                    processor_ids_to_map.add(actual_pid)
+                    areas_by_processor.setdefault(actual_pid, []).append(area)
 
+        for processor_id in sorted(processor_ids_to_map):
+            create_floor_proc_mapping(db, floor_id=db_floor.id, processor_id=processor_id)
+
+        ensure_floor_processor_mappings_from_areas(db, db_floor.id)
+
+        processor_data = []
+        for processor_id in sorted(processor_ids_to_map):
+            proc = db.query(Processor).filter(Processor.id == processor_id).first()
+            proc_areas = areas_by_processor.get(processor_id, [])
+            # Include any areas already on this floor for this processor
+            if not proc_areas:
+                proc_areas = (
+                    db.query(Area)
+                    .filter(Area.floor_id == db_floor.id, Area.processor_id == processor_id)
+                    .all()
+                )
             processor_data.append({
-                "processor_id": mapping.processor_id,
+                "processor_id": processor_id,
                 "server": proc.server if proc else None,
-                "areas": [{"area_id": a.id, "name": a.name} for a in proc_areas]
+                "areas": [{"area_id": a.id, "name": a.name} for a in proc_areas],
             })
 
         # Log floor creation (existing)
@@ -250,7 +350,8 @@ async def upload_floor(
             "id": db_floor.id,
             "floor_name": db_floor.name,
             "floor_image": image_path,
-            "processors": processor_data
+            "processors": processor_data,
+            "sort_order": db_floor.sort_order,
         }
 
     except Exception as e:
@@ -333,12 +434,19 @@ async def update_floor(
                             area.floor_id = floor_id
                             updated_areas.append(area)
                             proc_areas.append(area)
+                            # Keep mapping for the area's real processor as well
+                            if area.processor_id is not None:
+                                create_floor_proc_mapping(
+                                    db, floor_id=floor_id, processor_id=int(area.processor_id)
+                                )
 
                     processor_data.append({
                         "processor_id": mapping.processor_id,
                         "server": proc.server if proc else None,
                         "areas": [{"area_id": a.id, "name": a.name} for a in proc_areas]
                     })
+
+                ensure_floor_processor_mappings_from_areas(db, floor_id)
 
             except (json.JSONDecodeError, ValidationError) as e:
                 raise HTTPException(status_code=400, detail=f"Invalid 'processors' input: {str(e)}")
@@ -403,7 +511,8 @@ async def update_floor(
             "id": floor.id,
             "floor_name": floor.name,
             "floor_image": floor.image_path,
-            "processors": processor_data
+            "processors": processor_data,
+            "sort_order": floor.sort_order,
         }
 
     except Exception as e:
@@ -412,56 +521,102 @@ async def update_floor(
 
 
 
-@router.get("/list", response_model=List[FloorListOut])
+@router.get("/list", response_model=FloorListResponse)
 def list_floors(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    floors = db.query(Floor).all()
-    response = []
+    return _floor_list_response(db, current_user)
 
-    for floor in floors:
-        try:
-            #  Permission check — Operators must have at least "monitor" access for this floor
-            require_operator_permission_for_scope(
-                required_level=1,                # 1 = view/monitor
-                floor_ids=[floor.id],            # Check permission for this specific floor
-                enforce_on_empty_scope=True,     # Don’t allow empty scope
-                db=db,
-                current_user=current_user
-            )
-        except HTTPException as e:
-            if e.status_code == 403:  
-                # Skip floors without access instead of raising error
-                continue
-            raise   # re-raise other unexpected errors
 
-        # Build processor data
-        mappings = db.query(FloorProcMapping).filter(FloorProcMapping.floor_id == floor.id).all()
-        processors = []
-        for mapping in mappings:
-            processor = db.query(Processor).filter(Processor.id == mapping.processor_id).first()
-            if processor:
-                areas = db.query(Area).filter(
-                    Area.processor_id == processor.id,
-                    Area.floor_id == floor.id
-                ).all()
-                processors.append({
-                    "processor_id": processor.id,
-                    "server": processor.server,
-                    "areas": [{"area_id": a.id, "name": a.name} for a in areas]
-                })
+@router.get("/sort-settings", response_model=FloorSortSettingsResponse)
+def get_floor_sort_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_operator_permission_for_scope(
+        required_level=5,
+        db=db,
+        current_user=current_user,
+    )
+    payload = _floor_list_response(db, current_user)
+    return {
+        "manual_sort_enabled": payload["manual_sort_enabled"],
+        "floors": payload["floors"],
+    }
 
-        response.append({
-            "id": floor.id,
-            "floor_name": floor.name,
-            "floor_image": floor.image_path,
-            "processors": processors
-        })
 
-    response = natsort.natsorted(response, key=lambda x: x.get("floor_name") or "")
-    return response
+@router.put("/sort-settings", response_model=FloorSortSettingsResponse)
+def update_floor_sort_settings(
+    payload: FloorSortSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_operator_permission_for_scope(
+        required_level=5,
+        db=db,
+        current_user=current_user,
+    )
+    set_manual_sort_enabled(
+        db,
+        payload.manual_sort_enabled,
+        updated_by=current_user.id,
+    )
+    log_activity(
+        db=db,
+        user_id=current_user.id,
+        floor_id=None,
+        activity_type="GUI Triggered",
+        activity_description=(
+            f"Floor sorting set to {'manual' if payload.manual_sort_enabled else 'auto'} "
+            f"by user {current_user.id}|{current_user.name}."
+        ),
+    )
+    result = _floor_list_response(db, current_user)
+    return {
+        "manual_sort_enabled": result["manual_sort_enabled"],
+        "floors": result["floors"],
+    }
 
+
+@router.put("/reorder", response_model=FloorReorderResponse)
+def reorder_floor_list(
+    payload: FloorReorderRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_operator_permission_for_scope(
+        required_level=5,
+        db=db,
+        current_user=current_user,
+    )
+    if not payload.floor_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="floor_ids must not be empty",
+        )
+    try:
+        reorder_floors(db, payload.floor_ids)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    log_activity(
+        db=db,
+        user_id=current_user.id,
+        floor_id=None,
+        activity_type="GUI Triggered",
+        activity_description=(
+            f"Floor order updated by user {current_user.id}|{current_user.name}."
+        ),
+    )
+    result = _floor_list_response(db, current_user)
+    return {
+        "status": "success",
+        "manual_sort_enabled": result["manual_sort_enabled"],
+        "floors": result["floors"],
+    }
 
 
 @router.get("/get/{floor_id}", response_model=FloorListOut)
@@ -476,6 +631,10 @@ def get_floor_by_id(
 
     mappings = db.query(FloorProcMapping).filter(FloorProcMapping.floor_id == floor_id).all()
     processor_data = []
+    # Repair: include processors that own areas on this floor even if mapping was missing
+    ensure_floor_processor_mappings_from_areas(db, floor_id)
+    db.commit()
+    mappings = db.query(FloorProcMapping).filter(FloorProcMapping.floor_id == floor_id).all()
     for mapping in mappings:
         processor = db.query(Processor).filter(Processor.id == mapping.processor_id).first()
         if processor:
@@ -490,7 +649,8 @@ def get_floor_by_id(
         "id": floor.id,
         "floor_name": floor.name,
         "floor_image": floor.image_path,
-        "processors": processor_data
+        "processors": processor_data,
+        "sort_order": floor.sort_order,
     }
 
 

@@ -72,16 +72,19 @@ def update_alert_timestamps(record, new_alert_status):
     else:
         old_status = "unknown"
     
-    # Normalize old status values (handle legacy "okay"/"not_okay" values)
+    # Normalize old status values (handle legacy "okay"/"not_okay"/"Resolved" values)
     if old_status in ["okay", "Active"]:
         old_status = "ok"
-    elif old_status in ["not_okay", "Resolved"]:
+    elif old_status in ["not_okay"]:
         old_status = "not_ok"
+    elif old_status == "Resolved":
+        # Legacy rows may store Resolved as a status string; treat as already ok.
+        old_status = "ok"
     
     # Normalize new status values
-    if new_alert_status in ["okay", "Active"]:
+    if new_alert_status in ["okay", "Active", "Resolved"]:
         new_alert_status = "ok"
-    elif new_alert_status in ["not_okay", "Resolved"]:
+    elif new_alert_status in ["not_okay"]:
         new_alert_status = "not_ok"
     
     # Alert first appears (ok -> not_ok) - Set reported_time
@@ -206,7 +209,8 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
 
         results = []
         raw_device_data = []  # Collect raw device data for logging
-        
+        seen_device_codes = set()
+
         for dev in statuses:
             try:
                 href = dev.get("Device", {}).get("href") if isinstance(dev.get("Device"), dict) else dev.get("Device")
@@ -214,6 +218,7 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                     continue
 
                 device_code = int(href.strip("/").split("/")[-1])
+                seen_device_codes.add(device_code)
                 availability = dev.get("Availability", "Unknown")
 
                 # Read full device info - wrap in try/except to handle individual device failures
@@ -328,6 +333,18 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                 except Exception:
                     pass
                 continue
+
+        # Clear ghost Unavailable rows not present in this full inventory,
+        # then collapse duplicate active rows for the same serial.
+        try:
+            from app.crud.alert_reconciliation import (
+                clear_devices_not_in_inventory,
+                dedupe_active_devices_by_serial,
+            )
+            clear_devices_not_in_inventory(db, processor_id, seen_device_codes)
+            dedupe_active_devices_by_serial(db, processor_id)
+        except Exception as orphan_exc:
+            print(f"[Device Discovery] Orphan/dedupe cleanup failed for processor {processor_id}: {orphan_exc}")
 
         # Log all raw device data after collection (even if commit fails)
         # log_raw_device_data(processor_id, ip, raw_device_data)

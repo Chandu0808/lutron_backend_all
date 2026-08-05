@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session, joinedload
 from fastapi import HTTPException
 from app.models.quick_controls import QuickControl, QuickControlArea, QuickControlAreaAction, CreationMode
+from app.models.area import Area
 from app.schemas.quick_controls import QuickControlCreate, QuickControlUpdate
 from app.models.schedule import Schedule
 from app.crud.area import activate_scene_for_area, update_zones_by_area
@@ -24,13 +25,6 @@ def create_quick_control_entry(db: Session, payload: QuickControlCreate) -> Quic
         )
         db.add(qc_area)
         db.flush()
-
-        zone_status_count = sum(1 for action in area.actions if action.type == "zone_status")
-        if zone_status_count > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Only one 'zone_status' is allowed per area (Area ID: {area.area_id})"
-            )
 
         for action in area.actions:
             qc_action = QuickControlAreaAction(
@@ -81,13 +75,6 @@ def update_quick_control_entry(db: Session, control_id: int, payload: QuickContr
         )
         db.add(qc_area)
         db.flush()
-
-        zone_status_count = sum(1 for action in area.actions if action.type == "zone_status")
-        if zone_status_count > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Only one 'zone_status' allowed per area (Area ID: {area.area_id})"
-            )
 
         for action in area.actions:
             qc_action = QuickControlAreaAction(
@@ -147,8 +134,10 @@ def get_all_quick_controls(db: Session):
 
 def get_quick_control_by_id(db: Session, control_id: int):
     return db.query(QuickControl).options(
-        joinedload(QuickControl.quick_control_areas).joinedload(QuickControlArea.area),
-        joinedload(QuickControl.quick_control_areas).joinedload(QuickControlArea.actions)
+        joinedload(QuickControl.quick_control_areas)
+        .joinedload(QuickControlArea.area)
+        .joinedload(Area.floor),
+        joinedload(QuickControl.quick_control_areas).joinedload(QuickControlArea.actions),
     ).filter(QuickControl.id == control_id).first()
 
 
@@ -168,12 +157,30 @@ def trigger_quick_control_logic(quick_control_id: int, db: Session):
                     activate_scene_for_area(area_id, int(action.scene_code), db)
 
                 elif action.type == "zone_status":
-                    # For common light status actions (On/Off), use set_all_zones_on_off to control ALL zones in the area
-                    if action.zone_status in ["On", "Off"]:
+                    # Per-zone control when zone_id is set; area-wide On/Off only without zone_id.
+                    if action.zone_id:
+                        zone_data = {
+                            "zone_id": action.zone_id,
+                            "zone_type": action.zone_type.lower() if action.zone_type else ""
+                        }
+                        if zone_data["zone_type"] == "switched" and action.zone_status:
+                            zone_data["switched_state"] = action.zone_status
+                        elif zone_data["zone_type"] in ["dimmed", "whitetune"]:
+                            if action.zone_brightness:
+                                zone_data["level"] = int(action.zone_brightness.replace("%", ""))
+                            if action.zone_temperature and zone_data["zone_type"] == "whitetune":
+                                zone_data["kelvin"] = int(action.zone_temperature.replace("K", ""))
+                            if action.zone_status in ["On", "Off"] and "level" not in zone_data:
+                                zone_data["switched_state"] = action.zone_status
+                        elif zone_data["zone_type"] == "shade" and action.shade_level:
+                            zone_data["level"] = int(action.shade_level.replace("%", ""))
+                        elif action.zone_status in ["On", "Off"]:
+                            zone_data["switched_state"] = action.zone_status
+                        update_zones_by_area(db, area_id, [zone_data])
+                    elif action.zone_status in ["On", "Off"]:
                         from app.crud.area import set_all_zones_on_off
                         set_all_zones_on_off(db, area_id, action.zone_status)
                     else:
-                        # For specific zone controls (brightness, temperature, specific zone_id), use existing method
                         zone_data = {
                             "zone_id": action.zone_id,
                             "zone_type": action.zone_type.lower() if action.zone_type else ""

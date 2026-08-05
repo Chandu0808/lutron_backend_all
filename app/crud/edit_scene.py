@@ -28,11 +28,13 @@ def edit_scene_assignments(db: Session, area_id: int, scene_id: int, details: li
         "whitetune": "WhiteTuningLevelAssignments"
     }
     created_hrefs = {k: [] for k in assignment_urls}
-    # Step 1: Filter assignments per zone_type for this area
+    # Step 1: Filter assignments once per zone_type for this area
+    filtered_zone_types = set()
     for detail in details:
         zone_type = detail.get("zone_type")
-        if zone_type not in assignment_urls:
+        if zone_type not in assignment_urls or zone_type in filtered_zone_types:
             continue
+        filtered_zone_types.add(zone_type)
         send_json(ssock, {
             "CommuniqueType": "CreateRequest",
             "Header": {"Url": assignment_urls[zone_type]},
@@ -68,9 +70,10 @@ def edit_scene_assignments(db: Session, area_id: int, scene_id: int, details: li
         if assignment_href:
             update_url = assignment_href
         else:
-            # Fallback to old behavior if assignment_href not provided
+            # Fallback: index within same zone_type only
             hrefs = created_hrefs.get(zone_type, [])
-            idx = details.index(detail)
+            same_type_details = [d for d in details if d.get("zone_type") == zone_type]
+            idx = same_type_details.index(detail)
             if idx >= len(hrefs):
                 continue
             update_url = hrefs[idx]
@@ -165,6 +168,7 @@ def get_scene_status(db: Session, area_id: int, scene_id: int):
             zone_name = zone_meta_map.get(zone_id, f"Zone {zone_id}")
             out = {
                 "assignment_href": assignment.get("href"),
+                "zone_id": zone_id,
                 "zone_type": zone_type,
                 "zone_name": zone_name
             }

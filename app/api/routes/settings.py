@@ -157,7 +157,8 @@ def maintenance_report(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Fetch devices from all processors, filter by model-based type, and return a CSV report.
+    Fetch devices or occupancy mode data from handshake-complete processors and return a CSV report.
+    Device types and occupancy_mode are mutually exclusive.
     Continues when some processors are unreachable; fails only when none respond.
     """
     require_operator_permission_for_scope(
@@ -172,7 +173,11 @@ def maintenance_report(
     result = generate_maintenance_report(db, payload.types)
 
     if result["status"] == "error":
-        if result["message"] == "No processors configured":
+        if result["message"] in (
+            "No processors configured",
+            "No processors with completed handshake",
+            "occupancy_mode cannot be combined with device types",
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=result)
 

@@ -22,8 +22,24 @@ from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.dependencies.auth import get_current_user
 from app.dependencies.permissions import require_operator_permission_for_scope
+from app.crud.alert_reconciliation import (
+    active_device_filter_clauses,
+    active_driver_filter_clauses,
+    active_processor_filter_clauses,
+    reconcile_all_processors_from_leap,
+)
 
 router = APIRouter()
+
+
+def require_admin_or_superadmin(user: User = Depends(get_current_user)) -> User:
+    """Admin or Superadmin may force a live LEAP driver-alert reconcile."""
+    if user.role not in ("Admin", "Superadmin"):
+        raise HTTPException(
+            status_code=403,
+            detail="This action is restricted to Admin or Superadmin.",
+        )
+    return user
 
 
 # ------------------- Helper ------------------- #
@@ -180,8 +196,7 @@ def get_active_alerts(
         # Processor Alerts
         if include_type("Processor Not Responding") and type_display_map.get("Processor Not Responding", True):
             q_processors = db.query(Processor).filter(
-                Processor.ping_status == "not_ok",
-                Processor.display.is_(True),
+                *active_processor_filter_clauses(),
             )
             if current_user.role == "Operator":
                 q_processors = q_processors.join(
@@ -227,8 +242,7 @@ def get_active_alerts(
         # Device Alerts
         if include_type("Device Not Responding") and type_display_map.get("Device Not Responding", True):
             bad_devices = db.query(SensorAndModule).filter(
-                SensorAndModule.alert_status == "not_ok",
-                SensorAndModule.display.is_(True),
+                *active_device_filter_clauses(),
             ).all()
             for dev in bad_devices:
                 location = None
@@ -279,18 +293,9 @@ def get_active_alerts(
         driver_types = {"E2": "Ballast Failure", "FC": "Lamp Failure"}
         if include_type("Ballast Failure") or include_type("Lamp Failure") or include_type("Other Warnings"):
             drivers = db.query(Driver).filter(
-                Driver.alert_status.in_(["not_ok", "not_okay"]),
-                Driver.area_id.isnot(None),
-                Driver.display.is_(True),
+                *active_driver_filter_clauses(),
             ).all()
             for d in drivers:
-                # Exclude driver rows with NULL/empty error_code from being classified
-                # as "Other Warnings" (read-side only; recording logic unchanged).
-                if d.error_code is None:
-                    continue
-                if isinstance(d.error_code, str) and d.error_code.strip() == "":
-                    continue
-
                 location = None
                 area = None
                 
@@ -376,8 +381,7 @@ def get_alert_types(
 
         # Processor
         q_proc = db.query(Processor).filter(
-            Processor.ping_status == "not_ok",
-            Processor.display.is_(True),
+            *active_processor_filter_clauses(),
         )
         if current_user.role == "Operator":
             q_proc = q_proc.join(
@@ -388,8 +392,7 @@ def get_alert_types(
 
         # Devices
         q_devices = db.query(SensorAndModule).filter(
-            SensorAndModule.alert_status == "not_ok",
-            SensorAndModule.display.is_(True),
+            *active_device_filter_clauses(),
         ).all()
         for dev in q_devices:
             # Use area_id if available
@@ -408,17 +411,9 @@ def get_alert_types(
 
         # Drivers
         drivers = db.query(Driver).filter(
-            Driver.alert_status.in_(["not_ok", "not_okay"]),
-            Driver.area_id.isnot(None),
-            Driver.display.is_(True),
+            *active_driver_filter_clauses(),
         ).all()
         for d in drivers:
-            # Exclude driver rows with NULL/empty error_code from dropdown types.
-            if d.error_code is None:
-                continue
-            if isinstance(d.error_code, str) and d.error_code.strip() == "":
-                continue
-
             # Use area_id if available
             area = None
             if d.area_id:
@@ -439,6 +434,22 @@ def get_alert_types(
                     alert_types.add("Other Warnings")
 
         return {"status": "success", "alert_types": list(alert_types)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/reconcile_live")
+def reconcile_live_alerts(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_superadmin),
+):
+    """
+    Force a full LEAP /loadcontroller/status inventory reconcile for all
+    handshake processors. Idempotent; clears orphan/stale driver alerts only.
+    """
+    try:
+        summary = reconcile_all_processors_from_leap(db)
+        return {"status": "success", "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -14,6 +14,7 @@ class Floor(Base):
     x_right = Column(Float, nullable=True)
     y_top = Column(Float, nullable=True)
     y_bottom = Column(Float, nullable=True)
+    sort_order = Column(Integer, nullable=True)
 
     areas = relationship("Area", back_populates="floor")
     user_permissions = relationship("UserPermission", back_populates="floor")

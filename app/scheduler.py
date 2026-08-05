@@ -139,6 +139,36 @@ def schedule_device_refresh():
         print(f"[Scheduler Error] Could not schedule device refresh: {e}")
 
 
+def _run_driver_alert_live_reconcile():
+    """Periodic LEAP inventory reconcile for driver alerts (ghost clear)."""
+    try:
+        from app.database.session import SessionLocal
+        from app.crud.alert_reconciliation import reconcile_all_processors_from_leap
+
+        db = SessionLocal()
+        try:
+            summary = reconcile_all_processors_from_leap(db)
+            print(f"[Scheduler] Driver alert live reconcile: {summary}")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[Scheduler Error] Driver alert live reconcile failed: {e}")
+
+
+def schedule_driver_alert_live_reconcile():
+    try:
+        scheduler.add_job(
+            _run_driver_alert_live_reconcile,
+            CronTrigger(minute="*/15"),
+            id="driver_alert_live_reconcile",
+            replace_existing=True,
+            max_instances=1,
+        )
+        print("[Scheduler] Driver alert live reconcile scheduled every 15 min")
+    except Exception as e:
+        print(f"[Scheduler Error] Could not schedule driver alert live reconcile: {e}")
+
+
 # ------------------- Daily Data Backfill Task ------------------- #
 def daily_data_backfill():
     """
@@ -292,6 +322,7 @@ def schedule_occupancy_reconciliation():
 # Start scheduler
 scheduler.start()
 schedule_device_refresh()
+schedule_driver_alert_live_reconcile()
 schedule_daily_backfill()
 schedule_occupancy_reconciliation()
 

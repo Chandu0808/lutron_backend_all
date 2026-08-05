@@ -1,7 +1,7 @@
 import csv
 from io import StringIO
 from collections import defaultdict
-from fastapi import UploadFile
+from fastapi import UploadFile, HTTPException
 from sqlalchemy.orm import Session
 from app.models.area import Area
 from app.models.coordinate import Coordinate
@@ -11,7 +11,7 @@ from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
 
 
-def upload_area_coordinates(file: UploadFile, db: Session):
+def upload_area_coordinates(file: UploadFile, db: Session, expected_processor_id: int | None = None):
     contents = file.file.read().decode("utf-8")
     reader = csv.reader(StringIO(contents))
     headers = next(reader)
@@ -30,6 +30,15 @@ def upload_area_coordinates(file: UploadFile, db: Session):
             coord_strings = row[6:]
         except Exception:
             continue
+
+        if expected_processor_id is not None and processor_id != expected_processor_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Processor ID mismatch: CSV contains processor {processor_id}, "
+                    f"but expected processor {expected_processor_id}."
+                ),
+            )
 
         area = db.query(Area).filter_by(processor_id=processor_id, code=code).first()
         if area:

@@ -41,7 +41,10 @@ def edit_scene(
             db=db,
             area_id=request.area_id,
             scene_id=request.scene_id,
-            details=[detail.dict() for detail in request.details]
+            details=[
+                detail.model_dump() if hasattr(detail, "model_dump") else detail.dict()
+                for detail in request.details
+            ]
         )
 
         # Log into activity_report_log (user-level)

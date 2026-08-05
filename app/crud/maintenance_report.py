@@ -8,29 +8,66 @@ from sqlalchemy.orm import Session
 from app.models.processor import Processor
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 
-CSV_HEADERS = [
+DEVICE_CSV_BASE_HEADERS = [
     "ProcessorIP",
-    "AreaPath",
+    "Location",
     "DeviceName",
     "Model",
     "Serial",
     "AddressedState",
     "Availability",
-    "Occupancy",
 ]
+
+OCCUPANCY_COLUMN = "Occupancy"
+DEVICES_TYPE = "devices"
+KEYPAD_TYPE = "keypad"
+SENSORS_TYPE = "sensors"
+DRIVERS_TYPE = "drivers"
+OTHERS_TYPE = "others"
+AWN_RF_TYPE = "awn_rf"
+AWN_OCC_TYPE = "awn_occ"
+OCCUPANCY_COLUMN_TYPES = {SENSORS_TYPE, AWN_RF_TYPE, AWN_OCC_TYPE}
+
+
+def _normalized_model(model: Optional[str]) -> str:
+    return (model or "").lower().replace("-", "").replace("_", "")
 
 
 def classify_device_type(model: Optional[str]) -> str:
     model_lower = (model or "").lower()
-    if "qsn" in model_lower or "qsm" in model_lower:
-        return "devices"
-    if "pn" in model_lower:
-        return "keypad"
+    normalized = _normalized_model(model)
+    if "awn" in normalized and "rf" in model_lower:
+        return AWN_RF_TYPE
+    if "awn" in normalized and "occ" in model_lower:
+        return AWN_OCC_TYPE
     if "lrf" in model_lower:
-        return "sensors"
-    if "ballast" in model_lower:
-        return "drivers"
-    return "others"
+        return SENSORS_TYPE
+    if "dali" in model_lower or "ballast" in model_lower:
+        return DRIVERS_TYPE
+    if "pn" in model_lower or "pj" in model_lower or "pm" in model_lower:
+        return KEYPAD_TYPE
+    if "qs" in model_lower or "qw" in model_lower:
+        return DEVICES_TYPE
+    return OTHERS_TYPE
+
+
+def _device_csv_headers(device_types: Set[str]) -> List[str]:
+    headers = list(DEVICE_CSV_BASE_HEADERS)
+    if device_types & OCCUPANCY_COLUMN_TYPES:
+        headers.append(OCCUPANCY_COLUMN)
+    return headers
+
+
+OCCUPANCY_MODE_CSV_HEADERS = [
+    "ProcessorIP",
+    "AreaID",
+    "Location",
+    "OccupancyMode",
+    "LED_Auto",
+    "LED_Vacancy",
+    "LED_Disabled",
+]
+OCCUPANCY_MODE_TYPE = "occupancy_mode"
 
 
 def format_serial(serial_number) -> str:
@@ -42,6 +79,14 @@ def format_serial(serial_number) -> str:
     if text.lower().startswith("0x"):
         return "0" + text[2:].upper()
     return text
+
+
+def serial_for_maintenance_csv(serial_number) -> str:
+    """Format serial for CSV export; Excel preserves leading zeros via =\"...\"."""
+    serial = format_serial(serial_number)
+    if not serial:
+        return ""
+    return f'="{serial}"'
 
 
 def _resolve_area_path(sock, area_code: str, cache: Dict[str, str]) -> str:
@@ -72,22 +117,30 @@ def _resolve_area_path(sock, area_code: str, cache: Dict[str, str]) -> str:
     return path
 
 
-def _get_device_occupancy(sock, device_code: int) -> str:
-    send_json(
-        sock,
-        {
-            "CommuniqueType": "ReadRequest",
-            "Header": {"Url": f"/device/{device_code}/status"},
-        },
-    )
-    resp = recv_json(sock)
-    if not resp:
+def _get_area_occupancy_status(sock, area_code: Optional[str], cache: Dict[str, str]) -> str:
+    """Return processor AreaStatus.OccupancyStatus as-is, or empty when unavailable."""
+    if not area_code:
         return ""
+    if area_code in cache:
+        return cache[area_code]
 
-    body = resp.get("Body") or {}
-    status_obj = body.get("DeviceStatus") or {}
-    occupancy = status_obj.get("OccupancyStatus")
-    return occupancy if occupancy is not None else ""
+    result = ""
+    try:
+        send_json(
+            sock,
+            {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area_code}/status"},
+            },
+        )
+        resp = recv_json(sock)
+        status = (resp or {}).get("Body", {}).get("AreaStatus", {}).get("OccupancyStatus")
+        if status is not None and status != "":
+            result = str(status)
+    except Exception:
+        result = ""
+    cache[area_code] = result
+    return result
 
 
 def _fetch_processor_rows(processor: Processor, requested_types: Set[str]) -> List[dict]:
@@ -102,6 +155,8 @@ def _fetch_processor_rows(processor: Processor, requested_types: Set[str]) -> Li
 
     rows: List[dict] = []
     area_path_cache: Dict[str, str] = {}
+    area_occupancy_cache: Dict[str, str] = {}
+    include_occupancy = bool(requested_types & OCCUPANCY_COLUMN_TYPES)
 
     try:
         send_json(
@@ -128,7 +183,7 @@ def _fetch_processor_rows(processor: Processor, requested_types: Set[str]) -> Li
             except (TypeError, ValueError):
                 continue
 
-            availability = dev.get("Availability", "Unknown")
+            availability = dev.get("Availability") or ""
 
             send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": href}})
             dev_resp = recv_json(sock)
@@ -137,7 +192,8 @@ def _fetch_processor_rows(processor: Processor, requested_types: Set[str]) -> Li
                 continue
 
             device_model = dev_info.get("ModelNumber") or ""
-            if classify_device_type(device_model) not in requested_types:
+            device_type = classify_device_type(device_model)
+            if device_type not in requested_types:
                 continue
 
             area_code = None
@@ -146,30 +202,165 @@ def _fetch_processor_rows(processor: Processor, requested_types: Set[str]) -> Li
                 area_code = str(area_field["href"].strip("/").split("/")[-1])
 
             occupancy = ""
-            if "lrf" in device_model.lower():
-                try:
-                    occupancy = _get_device_occupancy(sock, device_code)
-                except Exception:
-                    occupancy = ""
+            if include_occupancy and device_type in OCCUPANCY_COLUMN_TYPES:
+                occupancy = _get_area_occupancy_status(sock, area_code, area_occupancy_cache)
 
-            rows.append(
-                {
-                    "ProcessorIP": processor.ipv4 or "",
-                    "AreaPath": _resolve_area_path(sock, area_code, area_path_cache) if area_code else "",
-                    "DeviceName": dev_info.get("Name") or "",
-                    "Model": device_model,
-                    "Serial": format_serial(dev_info.get("SerialNumber")),
-                    "AddressedState": dev_info.get("AddressedState") or "",
-                    "Availability": availability,
-                    "Occupancy": occupancy,
-                }
-            )
+            row = {
+                "ProcessorIP": processor.ipv4 or "",
+                "Location": _resolve_area_path(sock, area_code, area_path_cache) if area_code else "",
+                "DeviceName": dev_info.get("Name") or "",
+                "Model": device_model,
+                "Serial": serial_for_maintenance_csv(dev_info.get("SerialNumber")),
+                "AddressedState": dev_info.get("AddressedState") or "",
+                "Availability": availability,
+            }
+            if include_occupancy:
+                row[OCCUPANCY_COLUMN] = occupancy
+            rows.append(row)
     finally:
         try:
             sock.close()
         except Exception:
             pass
 
+    return rows
+
+
+def _read_led_state_via_button(sock, button_href: str) -> str:
+    send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": button_href}})
+    button_resp = recv_json(sock) or {}
+    led_href = (
+        button_resp.get("Body", {})
+        .get("Button", {})
+        .get("AssociatedLED", {})
+        .get("href")
+    )
+    if not led_href:
+        return ""
+    send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": f"{led_href}/status"}})
+    led_resp = recv_json(sock) or {}
+    state = led_resp.get("Body", {}).get("LEDStatus", {}).get("State")
+    return state if state else ""
+
+
+def _resolve_occupancy_mode(led_states: Dict[str, str]) -> str:
+    for mode, state in led_states.items():
+        if state == "On":
+            return mode
+    for mode, state in led_states.items():
+        if state == "Off":
+            return mode
+    return ""
+
+
+def _process_area_occupancy(
+    sock, area_id: str, processor_ip: str, area_path_cache: Dict[str, str]
+) -> dict:
+    row = {
+        "ProcessorIP": processor_ip,
+        "AreaID": area_id,
+        "Location": _resolve_area_path(sock, area_id, area_path_cache),
+        "OccupancyMode": "",
+        "LED_Auto": "",
+        "LED_Vacancy": "",
+        "LED_Disabled": "",
+    }
+    try:
+        send_json(
+            sock,
+            {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area_id}/associatedcontrolstation"},
+            },
+        )
+        cs_resp = recv_json(sock) or {}
+        control_stations = cs_resp.get("Body", {}).get("ControlStations") or []
+        occupancy_buttons: Dict[str, str] = {}
+        for cs in control_stations:
+            for ganged in cs.get("AssociatedGangedDevices", []):
+                device_href = ganged.get("Device", {}).get("href")
+                if not device_href:
+                    continue
+                send_json(
+                    sock,
+                    {
+                        "CommuniqueType": "ReadRequest",
+                        "Header": {"Url": f"{device_href}/buttongroup/expanded"},
+                    },
+                )
+                bg_resp = recv_json(sock) or {}
+                groups = bg_resp.get("Body", {}).get("ButtonGroupsExpanded") or []
+                for group in groups:
+                    for button in group.get("Buttons", []):
+                        name = button.get("Name", "")
+                        engraving = button.get("Engraving", {}).get("Text", "")
+                        href = button.get("href")
+                        if not href:
+                            continue
+                        text = f"{name} {engraving}".lower()
+                        if "enable" in text or "auto" in text:
+                            occupancy_buttons["Auto"] = href
+                        elif "vacancy" in text:
+                            occupancy_buttons["Vacancy"] = href
+                        elif "disable" in text:
+                            occupancy_buttons["Disabled"] = href
+        led_states: Dict[str, str] = {}
+        for mode, href in occupancy_buttons.items():
+            led_state = _read_led_state_via_button(sock, href)
+            led_states[mode] = led_state
+            row[f"LED_{mode}"] = led_state
+        row["OccupancyMode"] = _resolve_occupancy_mode(led_states)
+    except Exception:
+        pass
+    return row
+
+
+def _crawl_occupancy_rows(
+    sock, area_id: str, processor_ip: str, rows: List[dict], area_path_cache: Dict[str, str]
+) -> None:
+    send_json(
+        sock,
+        {
+            "CommuniqueType": "ReadRequest",
+            "Header": {"Url": f"/area/{area_id}/childarea/summary"},
+        },
+    )
+    resp = recv_json(sock) or {}
+    children = resp.get("Body", {}).get("AreaSummaries") or []
+    for child in children:
+        child_href = child.get("href", "")
+        child_id = child_href.strip("/").split("/")[-1] if child_href else ""
+        if child.get("IsLeaf", False):
+            rows.append(_process_area_occupancy(sock, child_id, processor_ip, area_path_cache))
+        else:
+            _crawl_occupancy_rows(sock, child_id, processor_ip, rows, area_path_cache)
+
+
+def _fetch_occupancy_mode_rows(processor: Processor) -> List[dict]:
+    sock = connect_to_processor(
+        ip=processor.ipv4,
+        mac=processor.mac,
+        system=processor.system,
+        processor_ipv4=processor.ipv4,
+    )
+    if not sock:
+        raise ConnectionError("Could not connect to processor")
+
+    rows: List[dict] = []
+    area_path_cache: Dict[str, str] = {}
+    try:
+        send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": "/area/rootarea"}})
+        root_resp = recv_json(sock) or {}
+        root_href = root_resp.get("Body", {}).get("Area", {}).get("href")
+        if not root_href:
+            return rows
+        root_id = root_href.strip("/").split("/")[-1]
+        _crawl_occupancy_rows(sock, root_id, processor.ipv4 or "", rows, area_path_cache)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
     return rows
 
 
@@ -181,12 +372,29 @@ def _build_filename(types: List[str], now: Optional[datetime] = None) -> str:
 
 def generate_maintenance_report(db: Session, types: List[str]) -> dict:
     requested_types = set(types)
-    processors = db.query(Processor).all()
+    device_types = requested_types - {OCCUPANCY_MODE_TYPE}
+    occupancy_requested = OCCUPANCY_MODE_TYPE in requested_types
 
-    if not processors:
+    if occupancy_requested and device_types:
         return {
             "status": "error",
-            "message": "No processors configured",
+            "message": "occupancy_mode cannot be combined with device types",
+            "processors_not_responding": [],
+            "filename": None,
+            "csv": None,
+        }
+
+    processors = db.query(Processor).filter_by(handshake_status=True).all()
+
+    if not processors:
+        has_any_processor = db.query(Processor).count() > 0
+        return {
+            "status": "error",
+            "message": (
+                "No processors with completed handshake"
+                if has_any_processor
+                else "No processors configured"
+            ),
             "processors_not_responding": [],
             "filename": None,
             "csv": None,
@@ -203,7 +411,10 @@ def generate_maintenance_report(db: Session, types: List[str]) -> dict:
             continue
 
         try:
-            rows = _fetch_processor_rows(processor, requested_types)
+            if occupancy_requested:
+                rows = _fetch_occupancy_mode_rows(processor)
+            else:
+                rows = _fetch_processor_rows(processor, device_types)
             any_responded = True
             all_rows.extend(rows)
         except Exception:
@@ -218,8 +429,11 @@ def generate_maintenance_report(db: Session, types: List[str]) -> dict:
             "csv": None,
         }
 
+    csv_headers = (
+        OCCUPANCY_MODE_CSV_HEADERS if occupancy_requested else _device_csv_headers(device_types)
+    )
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=CSV_HEADERS)
+    writer = csv.DictWriter(output, fieldnames=csv_headers)
     writer.writeheader()
     writer.writerows(all_rows)
 

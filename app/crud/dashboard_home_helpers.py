@@ -15,6 +15,11 @@ from app.models.sensors_and_modules import SensorAndModule
 from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.crud.schedule import fetch_combined_schedules
+from app.crud.alert_reconciliation import (
+    active_device_filter_clauses,
+    active_driver_filter_clauses,
+    active_processor_filter_clauses,
+)
 
 
 def _format_datetime_to_ist(dt: Optional[datetime]) -> Optional[str]:
@@ -100,8 +105,7 @@ def get_active_alerts_list_for_dashboard(
     # Processor Alerts
     if type_display_map.get("Processor Not Responding", True):
         q_processors = db.query(Processor).filter(
-            Processor.ping_status == "not_ok",
-            Processor.display.is_(True),
+            *active_processor_filter_clauses(),
         )
         if getattr(current_user, "role", None) == "Operator":
             q_processors = q_processors.join(
@@ -137,8 +141,7 @@ def get_active_alerts_list_for_dashboard(
     # Device Alerts
     if type_display_map.get("Device Not Responding", True):
         bad_devices = db.query(SensorAndModule).filter(
-            SensorAndModule.alert_status == "not_ok",
-            SensorAndModule.display.is_(True),
+            *active_device_filter_clauses(),
         ).all()
         for dev in bad_devices:
             location = None
@@ -176,18 +179,9 @@ def get_active_alerts_list_for_dashboard(
     # Driver Alerts
     driver_types = {"E2": "Ballast Failure", "FC": "Lamp Failure"}
     drivers = db.query(Driver).filter(
-        Driver.alert_status.in_(["not_ok", "not_okay"]),
-        Driver.area_id.isnot(None),
-        Driver.display.is_(True),
+        *active_driver_filter_clauses(),
     ).all()
     for d in drivers:
-        # Exclude driver rows with NULL/empty error_code from being shown as
-        # "Other Warnings" on the dashboard.
-        if d.error_code is None:
-            continue
-        if isinstance(d.error_code, str) and d.error_code.strip() == "":
-            continue
-
         location = None
         area = None
         if d.area_id:

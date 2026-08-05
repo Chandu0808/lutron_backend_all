@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from app.models.floor import Floor
 from app.models.area import Area
 from app.models.processor import Processor
-from app.models.events import CurrentAreaEvent
+from app.models.events import CurrentAreaEvent, CurrentZoneEvent
+from app.models.zone import Zone
 from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
 from app.models.coordinate import Coordinate
@@ -25,6 +26,123 @@ from app.crud.fofp_overlay import (
     get_overlay_positions_for_floor,
     get_zone_live_status_for_fofp,
 )
+
+
+def _level_to_light_fields(level):
+    """Map a dim level to floor light_status (on/off/None) + clamped 0–100 level."""
+    if level is None:
+        return None, 0
+    try:
+        light_level = max(0, min(100, int(round(float(level)))))
+    except (TypeError, ValueError):
+        return None, 0
+    if light_level == 0:
+        return "off", 0
+    return "on", light_level
+
+
+def _mark_areas_processor_unreachable(results_dict: dict, areas, *, light: bool = False) -> None:
+    """Map display: unreachable processor → original PDF colors (no heat fill / no cache)."""
+    for area in areas:
+        row = results_dict.get(area.id)
+        if not row:
+            continue
+        row["processor_reachable"] = False
+        if light:
+            row["light_status"] = None
+            row["light_level"] = None
+        else:
+            row["occupancy_status"] = None
+
+
+def _apply_cached_zone_levels(db: Session, results_dict: dict) -> None:
+    """
+    Fill areas still missing live light_status from listener cache (current_zone_status).
+    Uses max level of non-shade zones per area. Never raises.
+    Skips areas marked processor_reachable=False (Heat Map shows PDF original colors).
+    """
+    try:
+        need_ids = [
+            aid
+            for aid, row in results_dict.items()
+            if row.get("light_status") is None
+            and row.get("processor_reachable", True) is not False
+        ]
+        if not need_ids:
+            return
+
+        rows = (
+            db.query(CurrentZoneEvent.area_id, CurrentZoneEvent.level, Zone.type)
+            .outerjoin(Zone, Zone.id == CurrentZoneEvent.zone_id)
+            .filter(CurrentZoneEvent.area_id.in_(need_ids))
+            .all()
+        )
+
+        levels_by_area = defaultdict(list)
+        for area_id, level, zone_type in rows:
+            if area_id is None:
+                continue
+            if zone_type and str(zone_type).lower() == "shade":
+                continue
+            levels_by_area[area_id].append(level)
+
+        for area_id, levels in levels_by_area.items():
+            if area_id not in results_dict:
+                continue
+            if results_dict[area_id].get("light_status") is not None:
+                continue
+            if results_dict[area_id].get("processor_reachable") is False:
+                continue
+            valid = []
+            for lv in levels:
+                try:
+                    if lv is None:
+                        continue
+                    valid.append(max(0, min(100, int(round(float(lv))))))
+                except (TypeError, ValueError):
+                    continue
+            if not valid:
+                continue
+            status, light_level = _level_to_light_fields(max(valid))
+            if status is None:
+                continue
+            results_dict[area_id]["light_status"] = status
+            results_dict[area_id]["light_level"] = light_level
+    except Exception as e:
+        print(f"Cache light level fallback failed: {e}")
+
+
+def _apply_cached_occupancy(db: Session, results_dict: dict) -> None:
+    """Fill areas still missing occupancy from current_area_status. Never raises.
+    Skips areas marked processor_reachable=False (Heat Map shows PDF original colors).
+    """
+    try:
+        need_ids = [
+            aid
+            for aid, row in results_dict.items()
+            if row.get("occupancy_status") is None
+            and row.get("processor_reachable", True) is not False
+        ]
+        if not need_ids:
+            return
+
+        rows = (
+            db.query(CurrentAreaEvent.area_id, CurrentAreaEvent.occupancy_status)
+            .filter(CurrentAreaEvent.area_id.in_(need_ids))
+            .all()
+        )
+        for area_id, occupancy in rows:
+            if area_id is None or area_id not in results_dict:
+                continue
+            if results_dict[area_id].get("occupancy_status") is not None:
+                continue
+            if results_dict[area_id].get("processor_reachable") is False:
+                continue
+            if occupancy is None or occupancy == "Unknown":
+                continue
+            results_dict[area_id]["occupancy_status"] = occupancy
+    except Exception as e:
+        print(f"Cache occupancy fallback failed: {e}")
 
 
 def area_coordinates_to_rings(coordinates: Any) -> List[List[dict]]:
@@ -136,7 +254,10 @@ def update_floor_boundaries(db: Session, floor_id: int):
     return False
 
 def create_floor(db: Session, name: str, image_path: str):
+    from app.crud.floor_sort import assign_sort_order_on_create
+
     floor = Floor(name=name, image_path=image_path)
+    assign_sort_order_on_create(db, floor)
     db.add(floor)
     db.commit()
     db.refresh(floor)
@@ -168,6 +289,7 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
             "co-ordinates": area_coordinates_to_rings(area.coordinates),
             "light_status": None,
             "light_level": 0,
+            "processor_reachable": True,
         }
         for area in areas
     }
@@ -175,12 +297,13 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
     for processor_id, processor_areas in processor_area_map.items():
         processor = db.query(Processor).filter(Processor.id == processor_id).first()
         if not processor:
-            # Processor not found - areas remain with null status
+            # Processor not found — show PDF original colors on Heat Map
+            _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
             continue
 
         if not is_processor_reachable(processor.ipv4):
             print(f"Processor not reachable: {processor.ipv4}")
-            # Areas remain with null status - don't add them again
+            _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
             continue
 
         try:
@@ -190,6 +313,9 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
                     "Header": {"Url": "/area/status"}
                 })
                 response = recv_json(ssock)
+                if not isinstance(response, dict):
+                    print(f"Empty LEAP /area/status from {processor.ipv4}; will use cache")
+                    continue
                 status_map = {
                     item["href"]: item
                     for item in response.get("Body", {}).get("AreaStatuses", [])
@@ -198,17 +324,7 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
                 for area in processor_areas:
                     area_href = f"/area/{area.code}/status"
                     level = status_map.get(area_href, {}).get("Level")
-                    try:
-                        light_level = max(0, min(100, int(round(float(level)))))
-                    except (TypeError, ValueError):
-                        light_level = 0
-
-                    if level == 0:
-                        zone_status = "off"
-                    elif level:
-                        zone_status = "on"
-                    else:
-                        zone_status = None  # Changed from "unknown" to None
+                    zone_status, light_level = _level_to_light_fields(level)
 
                     # Update the area status in results_dict
                     results_dict[area.id]["light_status"] = zone_status
@@ -217,6 +333,9 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
         except Exception as e:
             print(f"Processor {processor.ipv4} error: {e}")
             # Areas remain with null status - no need to update
+
+    # Listener cache when live LEAP failed / empty response (not for ping-unreachable areas)
+    _apply_cached_zone_levels(db, results_dict)
 
     # Convert dict values to list
     results = list(results_dict.values())
@@ -316,7 +435,8 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
             "floor_id": area.floor_id,
             "processor_id": area.processor_id,
             "co-ordinates": area_coordinates_to_rings(area.coordinates),
-            "occupancy_status": None
+            "occupancy_status": None,
+            "processor_reachable": True,
         }
         for area in areas
     }
@@ -324,12 +444,12 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
     for processor_id, processor_areas in processor_area_map.items():
         processor = db.query(Processor).filter(Processor.id == processor_id).first()
         if not processor:
-            # Processor not found - areas remain with null status
+            _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
             continue
 
         if not is_processor_reachable(processor.ipv4):
             print(f"Processor not reachable: {processor.ipv4}")
-            # Areas remain with null status - don't add them again
+            _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
             continue
 
         try:
@@ -339,6 +459,9 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
                     "Header": {"Url": "/area/status"}
                 })
                 response = recv_json(ssock)
+                if not isinstance(response, dict):
+                    print(f"Empty LEAP /area/status (occupancy) from {processor.ipv4}; will use cache")
+                    continue
                 status_map = {
                     item["href"]: item
                     for item in response.get("Body", {}).get("AreaStatuses", [])
@@ -358,6 +481,9 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
         except Exception as e:
             print(f"Error retrieving occupancy from processor {processor.ipv4}: {e}")
             # Areas remain with null status - no need to update
+
+    # Listener cache when live LEAP failed / empty response (not for ping-unreachable areas)
+    _apply_cached_occupancy(db, results_dict)
 
     # Convert dict values to list
     results = list(results_dict.values())

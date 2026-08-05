@@ -35,15 +35,32 @@ def apply_schema() -> None:
         central_config_tables_present,
         ensure_central_config_tables,
     )
+    from app.database.migrate_variant_config import (
+        ensure_variant_config_tables,
+        seed_variant_config_defaults,
+        variant_config_tables_present,
+    )
 
     print("Applying central configuration tables...")
     ensure_central_config_tables(engine)
+    ensure_variant_config_tables(engine)
     if not central_config_tables_present(engine):
         print("ERROR: One or more central config tables are still missing.")
         sys.exit(1)
+    if not variant_config_tables_present(engine):
+        print("ERROR: One or more variant config tables are still missing.")
+        sys.exit(1)
+    seed_variant_config_defaults()
 
     insp = inspect(engine)
-    for name in ("installation_settings", "widget_configuration", "dashboard_layout"):
+    for name in (
+        "installation_settings",
+        "widget_configuration",
+        "dashboard_layout",
+        "variant_widget_configuration",
+        "variant_dashboard_layout",
+        "variant_theme_setting",
+    ):
         cols = [c["name"] for c in insp.get_columns(name)]
         print(f"  {name}: {', '.join(cols)}")
     print("Done.")

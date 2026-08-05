@@ -137,7 +137,11 @@ def fofp_get_layout(
     try:
         rows = (
             db.query(ZoneFloorplanPosition)
-            .filter(ZoneFloorplanPosition.floor_id == floor_id)
+            .filter(
+                ZoneFloorplanPosition.floor_id == floor_id,
+                ZoneFloorplanPosition.zone_available.is_(True),
+                ZoneFloorplanPosition.zone_id.isnot(None),
+            )
             .order_by(ZoneFloorplanPosition.id.asc())
             .all()
         )

@@ -48,9 +48,16 @@ class QuickControlArea(Base):
     )
 
     def to_dict(self):
+        floor = None
+        floor_id = None
+        if self.area is not None:
+            floor_id = self.area.floor_id
+            floor = self.area.floor
         area_dict = {
             "area_id": self.area_id,
             "area_name": self.area.name if self.area else None,
+            "floor_id": floor_id,
+            "floor_name": floor.name if floor else None,
             "actions": [action.to_dict() for action in self.actions]
         }
         return {k: v for k, v in area_dict.items() if v is not None}

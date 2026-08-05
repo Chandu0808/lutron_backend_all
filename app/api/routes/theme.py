@@ -1,14 +1,21 @@
 # routes/theme.py
-import os, random, shutil
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, status
+import os
+import random
+import shutil
+from typing import Optional
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import Optional
+
+from app.crud.variant_runtime import resolve_variant
+from app.crud.variant_theme_setting import (
+    get_variant_theme_settings_map,
+    upsert_variant_theme_setting,
+)
 from app.database.session import get_db
 from app.dependencies.auth import get_current_user
-from app.models.theme_model import Theme
 from app.models.user_model import User
-
 
 router = APIRouter()
 
@@ -24,48 +31,65 @@ def require_theme_editor(current_user: User = Depends(get_current_user)) -> User
         )
     return current_user
 
-@router.get("/")
-def get_theme(request: Request, db: Session = Depends(get_db)):
-    rows = db.query(Theme).all()
-    data = {row.key: row.value for row in rows}
-
-    base_url = str(request.base_url).rstrip("/")
-
-    return {
-        "status": "Success",
-        "background_image": f"{base_url}{data.get('background_image', '')}",
-        "ui_theme_colors": {
-            "background": data.get("ui.background", ""),
-            "content": data.get("ui.content", ""),
-            "button": data.get("ui.button", "")
-        },
-        "heatmap_colors": {
-            "light": data.get("heatmap.light", ""),
-            "occupancy": data.get("heatmap.occupancy", ""),
-            "energy": data.get("heatmap.energy", "")
-        }
-    }
-
-
-
-@router.get("/background")
-def get_background_image(request: Request, db: Session = Depends(get_db)):
-    rows = db.query(Theme).all()
-    data = {row.key: row.value for row in rows}
-
-    base_url = str(request.base_url).rstrip("/")
-
-    return {
-        "status": "Success",
-        "background_image": f"{base_url}{data.get('background_image', '')}"
-    }
 
 APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 UPLOAD_DIR = os.path.join(APP_DIR, "background_image")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 DEFAULT_BACKGROUND_IMAGE = "/background_image/defaultBg.png"
-THEME_BACKGROUND_KEY = "background_image"
+
+
+def _resolve_theme_map(db: Session, variant: Optional[str]) -> tuple[str, dict]:
+    resolved_variant = resolve_variant(db, variant)
+    data = get_variant_theme_settings_map(db, resolved_variant)
+    return resolved_variant, data
+
+
+def _resolve_background_image(base_url: str, data: dict) -> str:
+    raw = data.get("background", {}).get("image") or DEFAULT_BACKGROUND_IMAGE
+    if isinstance(raw, str) and raw.startswith("/"):
+        return f"{base_url}{raw}"
+    return str(raw)
+
+
+@router.get("/")
+def get_theme(
+    request: Request,
+    db: Session = Depends(get_db),
+    variant: Optional[str] = Query(default=None),
+):
+    _resolved_variant, data = _resolve_theme_map(db, variant)
+    base_url = str(request.base_url).rstrip("/")
+
+    return {
+        "status": "Success",
+        "background_image": _resolve_background_image(base_url, data),
+        "ui_theme_colors": {
+            "background": data.get("application", {}).get("background", ""),
+            "content": data.get("application", {}).get("content", ""),
+            "button": data.get("application", {}).get("button", ""),
+        },
+        "heatmap_colors": {
+            "light": data.get("heatmap", {}).get("light", ""),
+            "occupancy": data.get("heatmap", {}).get("occupancy", ""),
+            "energy": data.get("heatmap", {}).get("energy", ""),
+        },
+    }
+
+
+@router.get("/background")
+def get_background_image(
+    request: Request,
+    db: Session = Depends(get_db),
+    variant: Optional[str] = Query(default=None),
+):
+    _resolved_variant, data = _resolve_theme_map(db, variant)
+    base_url = str(request.base_url).rstrip("/")
+
+    return {
+        "status": "Success",
+        "background_image": _resolve_background_image(base_url, data),
+    }
 
 
 @router.post("/background_image_clear")
@@ -73,22 +97,21 @@ def clear_background_image(
     request: Request,
     db: Session = Depends(get_db),
     _editor: User = Depends(require_theme_editor),
+    variant: Optional[str] = Query(default=None),
 ):
     """Reset the application background image to the seeded default."""
-    theme_row = db.query(Theme).filter(Theme.key == THEME_BACKGROUND_KEY).first()
-    previous_value = theme_row.value if theme_row else None
-
-    if theme_row:
-        theme_row.value = DEFAULT_BACKGROUND_IMAGE
-    else:
-        theme_row = Theme(key=THEME_BACKGROUND_KEY, value=DEFAULT_BACKGROUND_IMAGE)
-        db.add(theme_row)
-
-    db.commit()
-    db.refresh(theme_row)
+    resolved_variant, data = _resolve_theme_map(db, variant)
+    previous_value = data.get("background", {}).get("image")
+    upsert_variant_theme_setting(
+        db,
+        resolved_variant,
+        "background",
+        "image",
+        DEFAULT_BACKGROUND_IMAGE,
+    )
 
     if previous_value and previous_value != DEFAULT_BACKGROUND_IMAGE:
-        uploaded_name = os.path.basename(previous_value)
+        uploaded_name = os.path.basename(str(previous_value))
         if uploaded_name.startswith("bg_"):
             uploaded_path = os.path.join(UPLOAD_DIR, uploaded_name)
             if os.path.isfile(uploaded_path):
@@ -109,103 +132,83 @@ async def update_background_image_with_file(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     _editor: User = Depends(require_theme_editor),
+    variant: Optional[str] = Query(default=None),
 ):
     try:
-        ext = file.filename.split('.')[-1]
+        ext = file.filename.split(".")[-1]
         unique_filename = f"bg_{random.randint(1000, 9999)}.{ext}"
         save_path = os.path.join(UPLOAD_DIR, unique_filename)
         with open(save_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         relative_path = f"/background_image/{unique_filename}"
-        theme_row = db.query(Theme).filter(Theme.key == "background_image").first()
-        if not theme_row:
-            theme_row = Theme(key="background_image", value=relative_path)
-            db.add(theme_row)
-        else:
-            theme_row.value = relative_path
-        db.commit()
-        db.refresh(theme_row)
-
+        resolved_variant = resolve_variant(db, variant)
+        upsert_variant_theme_setting(
+            db,
+            resolved_variant,
+            "background",
+            "image",
+            relative_path,
+        )
         return {"status": "Updated", "background_image": relative_path}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-# --- GET: current application theme colors ---
-@router.get("/application")
-def get_application_theme(db: Session = Depends(get_db)):
-    theme_keys = ['ui.background', 'ui.content', 'ui.button']
-    rows = db.query(Theme).filter(Theme.key.in_(theme_keys)).all()
-    data = {row.key: row.value for row in rows}
-
-    return {
-        "status": "Success",
-        "application_theme": {
-            "background": data.get("ui.background", ""),
-            "content": data.get("ui.content", ""),
-            "button": data.get("ui.button", "")
-        }
-    }
-
-# --- GET: current heatmap theme colors ---
-@router.get("/heatmap")
-def get_application_theme(db: Session = Depends(get_db)):
-    theme_keys = ['heatmap.light', 'heatmap.occupancy', 'heatmap.energy']
-    rows = db.query(Theme).filter(Theme.key.in_(theme_keys)).all()
-    data = {row.key: row.value for row in rows}
-
-    return {
-        "status": "Success",
-        "application_theme": {
-            "light": data.get("heatmap.light", ""),
-            "occupancy": data.get("heatmap.occupancy", ""),
-            "energy": data.get("heatmap.energy", "")
-        }
-    }
-
-
-# --- POST: update theme color ---
 class ApplicationThemeUpdateRequest(BaseModel):
     background: Optional[str] = None
     content: Optional[str] = None
     button: Optional[str] = None
+
+
+@router.get("/application")
+def get_application_theme(
+    db: Session = Depends(get_db),
+    variant: Optional[str] = Query(default=None),
+):
+    _resolved_variant, data = _resolve_theme_map(db, variant)
+    return {
+        "status": "Success",
+        "application_theme": {
+            "background": data.get("application", {}).get("background", ""),
+            "content": data.get("application", {}).get("content", ""),
+            "button": data.get("application", {}).get("button", ""),
+        },
+    }
+
 
 @router.post("/application")
 def update_application_theme_bulk(
     update: ApplicationThemeUpdateRequest,
     db: Session = Depends(get_db),
     _editor: User = Depends(require_theme_editor),
+    variant: Optional[str] = Query(default=None),
 ):
+    resolved_variant = resolve_variant(db, variant)
     update_map = {
-        "ui.background": update.background,
-        "ui.content": update.content,
-        "ui.button": update.button
+        "background": update.background,
+        "content": update.content,
+        "button": update.button,
     }
 
     updated_items = []
-
     for key, value in update_map.items():
         if value is None:
-            continue  # Skip if not provided
-
-        theme_row = db.query(Theme).filter(Theme.key == key).first()
-        if theme_row:
-            theme_row.value = value
-        else:
-            theme_row = Theme(key=key, value=value)
-            db.add(theme_row)
-
-        updated_items.append({key: value})
-
-    db.commit()
+            continue
+        upsert_variant_theme_setting(
+            db,
+            resolved_variant,
+            "application",
+            key,
+            value,
+        )
+        updated_items.append({f"application.{key}": value})
 
     return {
         "status": "Updated",
-        "updated_fields": updated_items
+        "updated_fields": updated_items,
     }
-
 
 
 class HeatmapBulkUpdateRequest(BaseModel):
@@ -214,36 +217,50 @@ class HeatmapBulkUpdateRequest(BaseModel):
     energy: Optional[str] = None
 
 
+@router.get("/heatmap")
+def get_heatmap_theme(
+    db: Session = Depends(get_db),
+    variant: Optional[str] = Query(default=None),
+):
+    _resolved_variant, data = _resolve_theme_map(db, variant)
+    return {
+        "status": "Success",
+        "application_theme": {
+            "light": data.get("heatmap", {}).get("light", ""),
+            "occupancy": data.get("heatmap", {}).get("occupancy", ""),
+            "energy": data.get("heatmap", {}).get("energy", ""),
+        },
+    }
+
+
 @router.post("/heatmap")
 def update_heatmap_theme_bulk(
     update: HeatmapBulkUpdateRequest,
     db: Session = Depends(get_db),
     _editor: User = Depends(require_theme_editor),
+    variant: Optional[str] = Query(default=None),
 ):
+    resolved_variant = resolve_variant(db, variant)
     update_map = {
-        "heatmap.light": update.light,
-        "heatmap.occupancy": update.occupancy,
-        "heatmap.energy": update.energy
+        "light": update.light,
+        "occupancy": update.occupancy,
+        "energy": update.energy,
     }
 
     updated_items = []
-
     for key, value in update_map.items():
         if value is None:
-            continue  # skip if the field wasn't included in the request
-
-        theme_row = db.query(Theme).filter(Theme.key == key).first()
-        if theme_row:
-            theme_row.value = value
-        else:
-            theme_row = Theme(key=key, value=value)
-            db.add(theme_row)
-
-        updated_items.append({key: value})
-
-    db.commit()
+            continue
+        upsert_variant_theme_setting(
+            db,
+            resolved_variant,
+            "heatmap",
+            key,
+            value,
+        )
+        updated_items.append({f"heatmap.{key}": value})
 
     return {
         "status": "Updated",
-        "updated_fields": updated_items
+        "updated_fields": updated_items,
     }

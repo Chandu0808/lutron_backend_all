@@ -6,7 +6,6 @@ import ssl as ssl_module
 from app.models.processor import Processor
 from app.database.session import SessionLocal, engine
 from sqlalchemy import inspect
-from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 from sqlalchemy.orm import Session
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -14,6 +13,22 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+# zeroconf uses native DLLs that Windows Application Control may block.
+# Keep import optional so the rest of the API can start without discovery.
+try:
+    from zeroconf import Zeroconf, ServiceBrowser, ServiceListener as _ServiceListener
+
+    ZEROCONF_AVAILABLE = True
+    ZEROCONF_IMPORT_ERROR = None
+except Exception as e:  # ImportError or DLL load failures
+    Zeroconf = None  # type: ignore
+    ServiceBrowser = None  # type: ignore
+
+    class _ServiceListener:  # type: ignore
+        """Stub base when zeroconf cannot load."""
+
+    ZEROCONF_AVAILABLE = False
+    ZEROCONF_IMPORT_ERROR = str(e)
 
 
 def ensure_processor_table():
@@ -35,11 +50,11 @@ def is_processor_reachable(ip: str, port: int = 8081) -> bool:
         return False
 
 
-class MyListener(ServiceListener):
+class MyListener(_ServiceListener):
     def __init__(self):
         self.devices = []
 
-    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+    def add_service(self, zc, type_: str, name: str) -> None:
         info = zc.get_service_info(type_, name)
         if not info:
             return

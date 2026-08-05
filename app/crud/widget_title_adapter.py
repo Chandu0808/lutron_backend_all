@@ -67,14 +67,24 @@ def get_merged_known_widget_titles(db: Session) -> Dict[str, Dict[str, str]]:
 
 def build_widget_titles_response_items(db: Session) -> list:
     merged = get_merged_known_widget_titles(db)
-    return [
-        {
-            "key": key,
-            "title": merged[key]["display_name"] or TITLE_DEFAULTS[key],
-            "dropdown_name": merged[key]["dropdown_name"] or DROPDOWN_DEFAULTS.get(key, ""),
-        }
-        for key in KNOWN_WIDGET_KEYS
-    ]
+    items = []
+    for key in KNOWN_WIDGET_KEYS:
+        display = merged[key]["display_name"] or TITLE_DEFAULTS[key]
+        # Prefer display_name over legacy DROPDOWN_DEFAULTS so earlier renames
+        # (which only wrote display_name) still show the custom label.
+        dropdown = (
+            merged[key]["dropdown_name"]
+            or display
+            or DROPDOWN_DEFAULTS.get(key, "")
+        )
+        items.append(
+            {
+                "key": key,
+                "title": display,
+                "dropdown_name": dropdown,
+            }
+        )
+    return items
 
 
 def rename_widget_via_configuration(
@@ -83,12 +93,38 @@ def rename_widget_via_configuration(
     display_name: str,
     updated_by: Optional[int],
 ) -> WidgetConfiguration:
-    return widget_config_crud.upsert_widget_configuration_by_key(
+    # Keep dropdown_name in sync — GET /widget_titles and the frontend both surface
+    # dropdown_name for labels; leaving it stale made renames look like they failed.
+    row = widget_config_crud.upsert_widget_configuration_by_key(
         db,
         widget_key,
         display_name=display_name,
+        dropdown_name=display_name,
         updated_by=updated_by,
     )
+    # Also sync every UI variant so variant-aware widget APIs stay consistent.
+    try:
+        from app.crud.variant_config_defaults import get_all_default_variants
+        from app.crud import variant_widget_configuration as variant_widget_crud
+
+        for variant in get_all_default_variants():
+            existing = variant_widget_crud.get_variant_widget_configuration_by_key(
+                db, variant, widget_key
+            )
+            if existing is None:
+                continue
+            variant_widget_crud.upsert_variant_widget_configuration_by_key(
+                db,
+                variant,
+                widget_key,
+                display_name=display_name,
+                dropdown_name=display_name,
+                updated_by=updated_by,
+            )
+    except Exception:
+        # Variant tables may not exist yet on older DBs; shared config still updated.
+        pass
+    return row
 
 
 def _upsert_configuration_default(

@@ -19,9 +19,11 @@ def extract_id_from_href(href: str) -> int:
     return int(href.strip("/").split("/")[-1])
 
 
-def prune_missing_leaf_areas(node: dict, db: Session, processor_id: int):
+def prune_missing_leaf_areas(node: dict, db: Session, processor_id: int, floor_id: int = None):
     """
     Keep ONLY leaf nodes that exist in Area table and have area_id.
+    When floor_id is provided, only keep leaves whose Area.floor_id matches
+    (prevents the same processor area appearing under every mapped floor).
     Intermediate nodes are never removed.
     """
 
@@ -34,14 +36,14 @@ def prune_missing_leaf_areas(node: dict, db: Session, processor_id: int):
         if area_code is None:
             return None
 
-        db_area = (
-            db.query(Area)
-            .filter(
-                Area.code == str(area_code),
-                Area.processor_id == processor_id
-            )
-            .first()
+        query = db.query(Area).filter(
+            Area.code == str(area_code),
+            Area.processor_id == processor_id,
         )
+        if floor_id is not None:
+            query = query.filter(Area.floor_id == floor_id)
+
+        db_area = query.first()
 
         if not db_area:
             return None  #  remove leaf
@@ -54,7 +56,7 @@ def prune_missing_leaf_areas(node: dict, db: Session, processor_id: int):
     pruned_children = []
 
     for child in children:
-        pruned_child = prune_missing_leaf_areas(child, db, processor_id)
+        pruned_child = prune_missing_leaf_areas(child, db, processor_id, floor_id)
         if pruned_child:
             pruned_children.append(pruned_child)
 
@@ -148,8 +150,9 @@ def get_area_tree_by_floor(db: Session, floor_id: int) -> list:
                 processor.id
             )
 
-            # PRUNE INVALID LEAF AREAS
-            tree = prune_missing_leaf_areas(tree, db, processor.id)
+            # PRUNE INVALID LEAF AREAS (scoped to this floor so shared
+            # processors do not expose other floors' area_ids here)
+            tree = prune_missing_leaf_areas(tree, db, processor.id, floor_id)
 
             if tree:
                 processor_trees.append(tree)

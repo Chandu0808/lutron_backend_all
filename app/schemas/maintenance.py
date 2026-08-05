@@ -2,7 +2,16 @@ from typing import List, Literal
 
 from pydantic import BaseModel, field_validator
 
-MaintenanceDeviceType = Literal["devices", "keypad", "sensors", "drivers", "others"]
+MaintenanceDeviceType = Literal[
+    "devices",
+    "keypad",
+    "sensors",
+    "drivers",
+    "others",
+    "awn_rf",
+    "awn_occ",
+    "occupancy_mode",
+]
 
 
 class MaintenanceReportRequest(BaseModel):

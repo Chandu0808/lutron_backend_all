@@ -3,7 +3,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.orm import Session
-from zeroconf import Zeroconf, ServiceBrowser
 from typing import List
 import time
 from datetime import datetime
@@ -16,7 +15,11 @@ from app.database.session import SessionLocal
 from app.models.processor import Processor
 from app.schemas.processor import ProcessorOut, ProcessorListAllOut
 from app.crud.processor import (
-    MyListener, 
+    MyListener,
+    ZEROCONF_AVAILABLE,
+    ZEROCONF_IMPORT_ERROR,
+    Zeroconf,
+    ServiceBrowser,
     ensure_processor_table,
     get_processor_cert_dir,
     ensure_processor_cert_dir,
@@ -124,6 +127,14 @@ def enrich_processor_details(db: Session, processor: Processor, ip: str):
 def perform_processor_discovery(db: Session) -> list[str]:
     ensure_processor_table()
 
+    # Skip mDNS discovery when zeroconf DLLs are blocked; callers can still use DB data.
+    if not ZEROCONF_AVAILABLE or Zeroconf is None or ServiceBrowser is None:
+        print(
+            "[Processor] Discovery skipped "
+            f"(zeroconf unavailable: {ZEROCONF_IMPORT_ERROR})"
+        )
+        return []
+
     listener = MyListener()
     zeroconf = Zeroconf()
     ServiceBrowser(zeroconf, "_lutron._tcp.local.", listener)
@@ -158,6 +169,15 @@ def perform_processor_discovery(db: Session) -> list[str]:
 
 @router.get("/discover", response_model=List[ProcessorOut])  # processor discovery
 def discover_lutron(db: Session = Depends(get_db)):
+    if not ZEROCONF_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Processor discovery unavailable: zeroconf could not load "
+                f"({ZEROCONF_IMPORT_ERROR}). Allow the zeroconf DLLs in Application "
+                "Control, or use existing processors from /processor/list_all."
+            ),
+        )
     found_serials = perform_processor_discovery(db)
     if not found_serials:
         raise HTTPException(status_code=404, detail="No processor found")
@@ -277,10 +297,11 @@ def download_leaf_areas_csv(
 @router.post("/area_coord")
 def create_area_coord(
     file: UploadFile = File(...),
+    processor_id: int = Query(..., description="Processor ID that must match CSV rows"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    return upload_area_coordinates(file, db)
+    return upload_area_coordinates(file, db, expected_processor_id=processor_id)
 
 
 @router.post("/processor_handshake")
