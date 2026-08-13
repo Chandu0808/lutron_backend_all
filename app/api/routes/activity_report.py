@@ -32,7 +32,8 @@ ALLOWED_DESC_KEYWORDS = (
 )
 
 
-@router.get("/", response_model=Union[dict, List[ActivityLogResponse]])
+# Use "" (not "/") so GET /activity_report matches without a trailing-slash 307 redirect.
+@router.get("", response_model=Union[dict, List[ActivityLogResponse]])
 def get_activity_logs(
     activity_type: Optional[str] = Query(None),
     floor_ids: Optional[List[int]] = Query(None, description="List of floor IDs"),

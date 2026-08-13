@@ -23,6 +23,8 @@ def update_area_occupancy_setting(db: Session, area_id: int, mode: str):
         raise HTTPException(status_code=500, detail="Processor not reachable")
 
     sock = connect_to_processor(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
+    if sock is None:
+        raise HTTPException(status_code=500, detail="Processor connection unavailable")
 
     try:
         mapping = get_occupancy_mapping(sock, area.code)
@@ -37,9 +39,9 @@ def update_area_occupancy_setting(db: Session, area_id: int, mode: str):
             "Header": {"Url": f"/button/{button_id}/commandprocessor"},
             "Body": {"Command": {"CommandType": "PressAndRelease"}}
         })
-        resp = recv_json(sock)
+        resp = recv_json(sock) or {}
 
-        if "ExceptionResponse" in resp.get("CommuniqueType", ""):
+        if "ExceptionResponse" in (resp.get("CommuniqueType") or ""):
             raise HTTPException(status_code=500, detail=f"Button press failed: {resp}")
 
         for m, info in mapping.items():
@@ -77,8 +79,12 @@ def get_area_occupancy_setting(db: Session, area_id: int):
         raise HTTPException(status_code=500, detail="Processor not reachable")
 
     sock = connect_to_processor(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
+    if sock is None:
+        return "Unknown"
     try:
         mapping = get_occupancy_mapping(sock, area.code)
+        if not mapping:
+            return "Unknown"
 
         for mode in ["Auto", "Disabled", "Vacancy"]:
             led_id = mapping.get(mode, {}).get("led_id")
@@ -89,11 +95,13 @@ def get_area_occupancy_setting(db: Session, area_id: int):
                 "CommuniqueType": "ReadRequest",
                 "Header": {"Url": f"/led/{led_id}/status"}
             })
-            resp = recv_json(sock)
-            led_state = resp.get("Body", {}).get("LEDStatus", {}).get("State")
+            resp = recv_json(sock) or {}
+            led_state = ((resp.get("Body") or {}).get("LEDStatus") or {}).get("State")
             if led_state == "On":
                 return mode
 
+    except Exception:
+        return "Unknown"
     finally:
         sock.close()
 

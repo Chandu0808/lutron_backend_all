@@ -113,8 +113,8 @@ def get_child_areas(area_href, sock):
             "Url": f"{area_href}/childarea/summary"
         }
     })
-    response = recv_json(sock)
-    return response.get("Body", {}).get("AreaSummaries", [])
+    response = recv_json(sock) or {}
+    return (response.get("Body") or {}).get("AreaSummaries", []) or []
 
 
 def read_area_details(area_href, sock):
@@ -125,8 +125,8 @@ def read_area_details(area_href, sock):
         }
     }
     send_json(sock, request)
-    response = recv_json(sock)
-    return response.get("Body", {}).get("Area", {})
+    response = recv_json(sock) or {}
+    return (response.get("Body") or {}).get("Area", {}) or {}
 
 def get_occupancy_mapping(sock, area_code: str):
     from app.utils.lutron_helpers import send_json, recv_json
@@ -136,18 +136,18 @@ def get_occupancy_mapping(sock, area_code: str):
             "CommuniqueType": "ReadRequest",
             "Header": {"Url": f"{area_href}/associatedcontrolstation"}
         })
-        resp = recv_json(sock)
-        return resp.get("Body", {}).get("ControlStations", [])
+        resp = recv_json(sock) or {}
+        return (resp.get("Body") or {}).get("ControlStations", []) or []
 
     def get_buttons(sock, device_href):
         send_json(sock, {
             "CommuniqueType": "ReadRequest",
             "Header": {"Url": f"{device_href}/buttongroup/expanded"}
         })
-        resp = recv_json(sock)
+        resp = recv_json(sock) or {}
         buttons = []
-        for group in resp.get("Body", {}).get("ButtonGroupsExpanded", []):
-            buttons.extend(group.get("Buttons", []))
+        for group in (resp.get("Body") or {}).get("ButtonGroupsExpanded", []) or []:
+            buttons.extend(group.get("Buttons") or [])
         return buttons
 
     area_href = f"/area/{area_code}"
@@ -155,15 +155,18 @@ def get_occupancy_mapping(sock, area_code: str):
     control_stations = get_control_stations(sock, area_href)
 
     for cs in control_stations:
-        for device in cs.get("AssociatedGangedDevices", []):
-            dev_href = device.get("Device", {}).get("href", "")
+        for device in cs.get("AssociatedGangedDevices") or []:
+            dev_href = ((device.get("Device") or {}).get("href") or "")
             if not dev_href:
                 continue
             buttons = get_buttons(sock, dev_href)
 
             for b in buttons:
-                engraving = b.get("Engraving", {}).get("Text", "").lower()
-                button_href = b.get("href", "")
+                engraving_obj = b.get("Engraving")
+                engraving = ""
+                if isinstance(engraving_obj, dict):
+                    engraving = (engraving_obj.get("Text") or "").lower()
+                button_href = b.get("href", "") or ""
                 if not button_href or not engraving:
                     continue
 
