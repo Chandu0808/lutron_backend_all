@@ -1,6 +1,7 @@
 # app/models/__init__.py
 
 from .area import Area
+from .area_scene import AreaScene
 from .area_group import AreaGroup, AreaGroupMapping
 from .coordinate import Coordinate
 from .events import (

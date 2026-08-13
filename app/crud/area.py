@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from app.models.area import Area
 from app.models.processor import Processor
 from app.models.events import CurrentAreaEvent, CurrentZoneEvent
+from app.models.area_scene import AreaScene
 from typing import List, Dict, Any, Optional, Tuple
 from math import sqrt
 from itertools import groupby
@@ -16,6 +17,9 @@ from app.schemas.area import Point
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.logger import logger
+
+
+_VALID_OCCUPANCY = frozenset({"Occupied", "Unoccupied"})
 
 
 def _enrich_zone_from_level(zone_id, zone_name, zone_type, level, kelvin=None):
@@ -132,9 +136,96 @@ def _area_occupancy_from_cache(db: Session, area_id: int):
     if not event:
         return None
     occ = event.occupancy_status
-    if occ is None or occ == "Unknown":
+    if occ not in _VALID_OCCUPANCY:
         return None
     return occ
+
+
+def _active_scene_from_cache(db: Session, area_id: int) -> Optional[int]:
+    event = (
+        db.query(CurrentAreaEvent)
+        .filter(CurrentAreaEvent.area_id == area_id)
+        .first()
+    )
+    if not event or event.current_scene_code is None:
+        return None
+    try:
+        return int(event.current_scene_code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scenes_from_db_cache(db: Session, area_id: int) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(AreaScene)
+        .filter(AreaScene.area_id == area_id)
+        .order_by(AreaScene.scene_code.asc())
+        .all()
+    )
+    return [{"id": int(r.scene_code), "name": r.name or ""} for r in rows]
+
+
+def _upsert_area_scenes_cache(db: Session, area_id: int, area_scenes: List[Dict[str, Any]]) -> None:
+    """Replace cached scene list for this area_id after a successful LEAP read (including [])."""
+    try:
+        db.query(AreaScene).filter(AreaScene.area_id == area_id).delete(synchronize_session=False)
+        for scene in area_scenes or []:
+            db.add(
+                AreaScene(
+                    area_id=area_id,
+                    scene_code=int(scene["id"]),
+                    name=(scene.get("name") or "")[:200],
+                )
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"[Scene Cache] Failed to upsert scenes for area {area_id}: {e}")
+
+
+def _parse_area_scenes_from_leap(scene_list) -> List[Dict[str, Any]]:
+    area_scenes = []
+    for scene in scene_list or []:
+        if not isinstance(scene, dict):
+            continue
+        href = scene.get("href") or ""
+        try:
+            scene_id = int(str(href).rstrip("/").split("/")[-1])
+        except (TypeError, ValueError):
+            continue
+        area_scenes.append({"id": scene_id, "name": scene.get("Name") or ""})
+    return area_scenes
+
+
+def _leap_read_area_scenes(ssock, area_code) -> Optional[List[Dict[str, Any]]]:
+    """
+    Read /area/{code}/areascene. Returns a parsed list (possibly empty) on a
+    valid LEAP dict, or None when the socket/response failed (caller may retry).
+    """
+    if not ssock or not area_code:
+        return None
+    send_json(ssock, {
+        "CommuniqueType": "ReadRequest",
+        "Header": {"Url": f"/area/{area_code}/areascene"},
+    })
+    scenes_response = recv_json(ssock)
+    if not isinstance(scenes_response, dict):
+        return None
+    scene_list = (scenes_response.get("Body") or {}).get("AreaScenes", []) or []
+    return _parse_area_scenes_from_leap(scene_list)
+
+
+def _parse_active_scene_id(area_status: dict) -> Optional[int]:
+    current_scene = area_status.get("CurrentScene") if isinstance(area_status, dict) else None
+    if not isinstance(current_scene, dict):
+        return None
+    active_href = current_scene.get("href")
+    if not active_href:
+        return None
+    try:
+        return int(str(active_href).rstrip("/").split("/")[-1])
+    except (TypeError, ValueError):
+        return None
 
 
 def get_area_scene_summary_by_area_id(db: Session, area_id: int):
@@ -148,12 +239,29 @@ def get_area_scene_summary_by_area_id(db: Session, area_id: int):
         logger.error(f"[Scene Summary] Processor not found for area {area_id}")
         return {"status": "error", "message": "Processor not found"}
 
+    cached_scenes = _scenes_from_db_cache(db, area_id)
+    cached_active = _active_scene_from_cache(db, area_id)
+
     if not is_processor_reachable(processor.ipv4):
-        logger.warning(f"[Scene Summary] Processor {processor.ipv4} not reachable")
+        logger.warning(f"[Scene Summary] Processor {processor.ipv4} not reachable; using cache")
+        if cached_scenes:
+            return {
+                "status": "success",
+                "active_scene": cached_active,
+                "area_scenes": cached_scenes,
+            }
         return {"status": "error", "message": f"Processor {processor.ipv4} not reachable"}
 
     try:
         ssock = connect_to_processor(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
+        if ssock is None:
+            if cached_scenes:
+                return {
+                    "status": "success",
+                    "active_scene": cached_active,
+                    "area_scenes": cached_scenes,
+                }
+            return {"status": "error", "message": "Processor connection unavailable"}
 
         logger.info(f"[Scene Summary] Fetching scenes for area {area.code}")
         send_json(ssock, {
@@ -162,25 +270,36 @@ def get_area_scene_summary_by_area_id(db: Session, area_id: int):
         })
         scenes_response = recv_json(ssock)
 
-        scene_list = scenes_response.get("Body", {}).get("AreaScenes", [])
+        if not isinstance(scenes_response, dict):
+            ssock.close()
+            if cached_scenes:
+                return {
+                    "status": "success",
+                    "active_scene": cached_active,
+                    "area_scenes": cached_scenes,
+                }
+            return {"status": "error", "message": "Empty LEAP scenes response"}
+
+        scene_list = (scenes_response.get("Body") or {}).get("AreaScenes", []) or []
 
         send_json(ssock, {
             "CommuniqueType": "ReadRequest",
             "Header": {"Url": f"/area/{area.code}/status"}
         })
         status_response = recv_json(ssock)
-
-        area_status = status_response.get("Body", {}).get("AreaStatus", {})
-        current_scene = area_status.get("CurrentScene")
-        active_href = current_scene.get("href") if current_scene else None
-        active_scene_id = int(active_href.split("/")[-1]) if active_href else None
-
         ssock.close()
 
-        area_scenes = [
-            {"id": int(scene["href"].split("/")[-1]), "name": scene.get("Name", "")}
-            for scene in scene_list
-        ]
+        area_status = {}
+        if isinstance(status_response, dict):
+            area_status = (status_response.get("Body") or {}).get("AreaStatus", {}) or {}
+
+        active_scene_id = _parse_active_scene_id(area_status)
+        if active_scene_id is None:
+            active_scene_id = cached_active
+
+        area_scenes = _parse_area_scenes_from_leap(scene_list)
+        # Successful LEAP for this area_id: [] is valid; do not keep stale cache.
+        _upsert_area_scenes_cache(db, area_id, area_scenes)
 
         return {
             "status": "success",
@@ -190,6 +309,12 @@ def get_area_scene_summary_by_area_id(db: Session, area_id: int):
 
     except Exception as e:
         logger.exception(f"[Scene Summary] Error for area {area_id}: {e}")
+        if cached_scenes:
+            return {
+                "status": "success",
+                "active_scene": cached_active,
+                "area_scenes": cached_scenes,
+            }
         return {"status": "error", "message": str(e)}
 
 def _lutron_zone_code_from_href(href: Optional[str]) -> Optional[int]:
@@ -443,8 +568,17 @@ def get_area_occupancy_status(db: Session, area_id: int):
                 return {"status": "success", "occupancy_status": cached}
             return {"status": "error", "message": "Empty LEAP response"}
 
-        occ_status = response.get("Body", {}).get("AreaStatus", {}).get("OccupancyStatus", "Unknown")
-        return {"status": "success", "occupancy_status": occ_status}
+        occ_status = (response.get("Body") or {}).get("AreaStatus", {})
+        if not isinstance(occ_status, dict):
+            occ_status = {}
+        raw_occ = occ_status.get("OccupancyStatus", "Unknown")
+        # Keep last good Occupied/Unoccupied — never overwrite UI with Unknown from flaky LEAP.
+        if raw_occ not in _VALID_OCCUPANCY:
+            cached = _area_occupancy_from_cache(db, area_id)
+            if cached is not None:
+                return {"status": "success", "occupancy_status": cached}
+            return {"status": "success", "occupancy_status": "Unknown"}
+        return {"status": "success", "occupancy_status": raw_occ}
 
     except Exception as e:
         logger.exception(f"[Occupancy] Error for area {area_id}: {e}; using cache")
@@ -452,6 +586,194 @@ def get_area_occupancy_status(db: Session, area_id: int):
         if cached is not None:
             return {"status": "success", "occupancy_status": cached}
         return {"status": "error", "message": str(e)}
+
+
+def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
+    """
+    Single-socket LEAP assembly for heatmap sidebar.
+    Energy always from DB. Scenes list / zones / light / occ use one connection when
+    reachable, with per-section DB cache fallback. active_scene is live LEAP
+    CurrentScene only (null if missing) so the UI does not highlight a stale scene.
+    Response shape matches the existing /area/full_area_status wire format.
+    """
+    area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        return {"status": "error", "message": "Area not found"}
+
+    processor = db.query(Processor).filter(Processor.id == area.processor_id).first()
+
+    energy_result = get_area_energy_status(db, area_id)
+    if energy_result.get("status") == "success":
+        c = energy_result.get("consumption")
+        s = energy_result.get("savings")
+        consumption = round(c, 2) if isinstance(c, (int, float)) else c
+        savings = round(s, 2) if isinstance(s, (int, float)) else s
+    else:
+        consumption = "Unknown"
+        savings = "Unknown"
+
+    area_scenes = _scenes_from_db_cache(db, area_id)
+    # LMS-style: highlight only from live LEAP CurrentScene (null = no button selected).
+    # Do not seed from DB cache — stale current_scene_code (e.g. OFF) caused false highlights
+    # while zones/light were On.
+    active_scene = None
+    zones = _zones_from_db_cache(db, area_id)
+    light_status = _area_light_from_cache(db, area_id) or "Unknown"
+    occupancy_status = _area_occupancy_from_cache(db, area_id) or "Unknown"
+
+    def _payload():
+        return {
+            "status": "success",
+            "floor_id": area.floor_id,
+            "area_id": area.id,
+            "area_name": area.name,
+            "area_code": area.code,
+            "light_status": light_status,
+            "occupancy_status": occupancy_status,
+            "active_scene": active_scene,
+            "area_scenes": area_scenes,
+            "zones": zones,
+            "consumption": consumption,
+            "savings": savings,
+        }
+
+    if not processor or not is_processor_reachable(processor.ipv4):
+        logger.warning(
+            f"[Full Area Status] Processor unreachable for area {area_id}; serving cache"
+        )
+        return _payload()
+
+    ssock = None
+    try:
+        ssock = connect_to_processor(
+            processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+        )
+        if ssock is None:
+            return _payload()
+
+        # --- Scenes (same socket; one reconnect retry on transport fail) ---
+        parsed = None
+        try:
+            parsed = _leap_read_area_scenes(ssock, area.code)
+        except Exception as e:
+            logger.warning(f"[Full Area Status] Scenes read failed area {area_id}: {e}")
+            parsed = None
+
+        if parsed is None and area.code:
+            logger.warning(f"[Full Area Status] Scenes LEAP retry area {area_id}")
+            try:
+                if ssock is not None:
+                    try:
+                        ssock.close()
+                    except Exception:
+                        pass
+                    ssock = None
+                ssock = connect_to_processor(
+                    processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+                )
+                if ssock is not None:
+                    parsed = _leap_read_area_scenes(ssock, area.code)
+            except Exception as e:
+                logger.warning(f"[Full Area Status] Scenes retry failed area {area_id}: {e}")
+                parsed = None
+
+        if parsed is not None:
+            # Successful LEAP for this area_id only: [] is valid (no programmed scenes).
+            area_scenes = parsed
+            _upsert_area_scenes_cache(db, area_id, area_scenes)
+
+        # --- Area status: light + occupancy + active scene (one read) ---
+        try:
+            send_json(ssock, {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area.code}/status"}
+            })
+            status_response = recv_json(ssock)
+            if isinstance(status_response, dict):
+                area_status = (status_response.get("Body") or {}).get("AreaStatus", {}) or {}
+                # Always take live CurrentScene (including None) — never keep a prior cached id.
+                active_scene = _parse_active_scene_id(area_status)
+
+                level = area_status.get("Level", 0)
+                try:
+                    level_n = float(level) if level is not None else 0
+                except (TypeError, ValueError):
+                    level_n = 0
+                light_status = "On" if level_n > 0 else "Off"
+
+                raw_occ = area_status.get("OccupancyStatus")
+                if raw_occ in _VALID_OCCUPANCY:
+                    occupancy_status = raw_occ
+                # else keep cached Occupied/Unoccupied / Unknown
+        except Exception as e:
+            logger.warning(f"[Full Area Status] Area status read failed area {area_id}: {e}")
+
+        # --- Zones metadata + status (same socket) ---
+        try:
+            send_json(ssock, {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area.code}/associatedzone"}
+            })
+            metadata_resp = recv_json(ssock)
+            zone_meta_map = {}
+            if isinstance(metadata_resp, dict):
+                for zone in (metadata_resp.get("Body") or {}).get("Zones", []) or []:
+                    try:
+                        zid = int(str(zone.get("href", "")).rstrip("/").split("/")[-1])
+                    except (TypeError, ValueError):
+                        continue
+                    zone_meta_map[zid] = {
+                        "name": zone.get("Name", f"Zone {zid}"),
+                        "type": zone.get("ControlType", "Unknown"),
+                    }
+
+            send_json(ssock, {
+                "CommuniqueType": "ReadRequest",
+                "Header": {"Url": f"/area/{area.code}/associatedzone/status"}
+            })
+            status_resp = recv_json(ssock)
+            if isinstance(status_resp, dict):
+                enriched_zones = []
+                for status in (status_resp.get("Body") or {}).get("ZoneStatuses", []) or []:
+                    zone_href = ((status.get("Zone") or {}).get("href") or "")
+                    try:
+                        zone_id = int(str(zone_href).rstrip("/").split("/")[-1]) if zone_href else None
+                    except (TypeError, ValueError):
+                        zone_id = None
+                    if zone_id is None:
+                        continue
+                    level = status.get("Level", 0)
+                    meta = zone_meta_map.get(zone_id, {})
+                    kelvin = None
+                    cts = status.get("ColorTuningStatus") or {}
+                    wtl = cts.get("WhiteTuningLevel") if isinstance(cts, dict) else None
+                    if isinstance(wtl, dict):
+                        kelvin = wtl.get("Kelvin")
+                    enriched_zones.append(
+                        _enrich_zone_from_level(
+                            zone_id,
+                            meta.get("name", f"Zone {zone_id}"),
+                            meta.get("type", "Unknown"),
+                            level,
+                            kelvin,
+                        )
+                    )
+                if enriched_zones:
+                    zones = enriched_zones
+        except Exception as e:
+            logger.warning(f"[Full Area Status] Zones read failed area {area_id}: {e}")
+
+    except Exception as e:
+        logger.exception(f"[Full Area Status] LEAP assembly failed area {area_id}: {e}")
+    finally:
+        if ssock is not None:
+            try:
+                ssock.close()
+            except Exception:
+                pass
+
+    return _payload()
+
 
 def get_area_energy_status(db: Session, area_id: int):
     """

@@ -2,6 +2,7 @@ from collections import defaultdict
 from itertools import groupby
 from fastapi import HTTPException
 from typing import List, Any
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.floor import Floor
 from app.models.area import Area
@@ -18,6 +19,7 @@ from app.schemas.floor import (
     Unit,
 )
 
+from app.utils.floor_plan_media import floor_plan_client_url
 from app.crud.fofp_settings import get_fofp_settings
 from app.crud.fofp_overlay import (
     attach_driver_alerts_to_positions,
@@ -342,7 +344,7 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
 
     response = {
         "status": "success",
-        "floor_plan": floor.image_path,
+        "floor_plan": floor_plan_client_url(floor.id),
         "boundary_values": {
             "x_left": round(floor.x_left) if floor.x_left else 0,
             "x_right": round(floor.x_right) if floor.x_right else 0,
@@ -490,7 +492,7 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
 
     return {
         "status": "success",
-        "floor_plan": floor.image_path,
+        "floor_plan": floor_plan_client_url(floor.id),
         "boundary_values": {
             "x_left": round(floor.x_left) if floor.x_left else 0,
             "x_right": round(floor.x_right) if floor.x_right else 0,
@@ -503,6 +505,40 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
         "y_bottom": floor.y_bottom,
         "areas": results
     }
+
+def get_floor_status_revision(db: Session, floor_id: int):
+    """
+    Cheap DB fingerprint for heatmap area-click: max updated_at of area + zone
+    status rows on this floor. No LEAP.
+    """
+    floor = db.query(Floor).filter(Floor.id == floor_id).first()
+    if not floor:
+        return {"status": "error", "message": "Floor not found"}
+
+    area_ids = [
+        row[0] for row in db.query(Area.id).filter(Area.floor_id == floor_id).all()
+    ]
+    if not area_ids:
+        return {"status": "success", "floor_id": floor_id, "revision": None}
+
+    area_max = (
+        db.query(func.max(CurrentAreaEvent.updated_at))
+        .filter(CurrentAreaEvent.area_id.in_(area_ids))
+        .scalar()
+    )
+    zone_max = (
+        db.query(func.max(CurrentZoneEvent.updated_at))
+        .filter(CurrentZoneEvent.area_id.in_(area_ids))
+        .scalar()
+    )
+    times = [t for t in (area_max, zone_max) if t is not None]
+    revision = max(times) if times else None
+    return {
+        "status": "success",
+        "floor_id": floor_id,
+        "revision": revision.isoformat() if revision is not None else None,
+    }
+
 
 def get_area_energy_status_by_floor(db: Session, floor_id: int):
     # Step 1: Validate floor existence
@@ -557,7 +593,7 @@ def get_area_energy_status_by_floor(db: Session, floor_id: int):
 
     return {
         "status": "success",
-        "floor_plan": floor.image_path,
+        "floor_plan": floor_plan_client_url(floor.id),
         "boundary_values": {
             "x_left": round(floor.x_left) if floor.x_left else 0,
             "x_right": round(floor.x_right) if floor.x_right else 0,

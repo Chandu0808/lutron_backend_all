@@ -1,6 +1,14 @@
 import re
-from app.utils.definitions import get_proc_hostname
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
+
+
+def _engraving_text(obj) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    engraving = obj.get("Engraving")
+    if not isinstance(engraving, dict):
+        return ""
+    return (engraving.get("Text") or "").strip().lower()
 
 
 def get_device_lock_status_by_area(db, area):
@@ -8,69 +16,82 @@ def get_device_lock_status_by_area(db, area):
     if not processor:
         return {"status": "error", "message": "Processor not found"}
 
+    sock = None
     try:
-        with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as sock:
-            area_code = area.code
-            send_json(sock, {
-                "CommuniqueType": "ReadRequest",
-                "Header": {"Url": f"/area/{area_code}/associatedcontrolstation"}
-            })
-            response = recv_json(sock)
-            control_stations = response.get("Body", {}).get("ControlStations", [])
+        sock = create_ssl_connection(
+            processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+        )
+        if sock is None:
+            return {"status": "success", "devices": []}
 
-            device_statuses = []
+        area_code = area.code
+        send_json(sock, {
+            "CommuniqueType": "ReadRequest",
+            "Header": {"Url": f"/area/{area_code}/associatedcontrolstation"}
+        })
+        response = recv_json(sock) or {}
+        control_stations = (response.get("Body") or {}).get("ControlStations") or []
 
-            for station in control_stations:
-                for device in station.get("AssociatedGangedDevices", []):
-                    device_href = device.get("Device", {}).get("href")
-                    if not device_href:
-                        continue
+        device_statuses = []
 
-                    send_json(sock, {
-                        "CommuniqueType": "ReadRequest",
-                        "Header": {"Url": f"{device_href}/buttongroup/expanded"}
-                    })
-                    btn_response = recv_json(sock)
-                    btn_groups = btn_response.get("Body", {}).get("ButtonGroupsExpanded", [])
+        for station in control_stations:
+            for device in station.get("AssociatedGangedDevices") or []:
+                device_href = ((device.get("Device") or {}).get("href"))
+                if not device_href:
+                    continue
 
-                    for group in btn_groups:
-                        for button in group.get("Buttons", []):
-                            engraving = button.get("Engraving", {}).get("Text", "").strip().lower()
-                            if engraving not in ["lock/unlock", "device lock/unlock"]:
-                                continue
+                send_json(sock, {
+                    "CommuniqueType": "ReadRequest",
+                    "Header": {"Url": f"{device_href}/buttongroup/expanded"}
+                })
+                btn_response = recv_json(sock) or {}
+                btn_groups = (btn_response.get("Body") or {}).get("ButtonGroupsExpanded") or []
 
-                            button_href = button.get("href", "")
-                            match = re.search(r"/button/(\d+)", button_href)
-                            if not match:
-                                continue
+                for group in btn_groups:
+                    for button in group.get("Buttons") or []:
+                        engraving = _engraving_text(button)
+                        if engraving not in ["lock/unlock", "device lock/unlock"]:
+                            continue
 
-                            button_id = int(match.group(1))
+                        button_href = button.get("href", "") or ""
+                        match = re.search(r"/button/(\d+)", button_href)
+                        if not match:
+                            continue
 
-                            send_json(sock, {
-                                "CommuniqueType": "ReadRequest",
-                                "Header": {"Url": f"/button/{button_id}"}
-                            })
-                            btn_detail = recv_json(sock)
-                            led_href = btn_detail.get("Body", {}).get("Button", {}).get("AssociatedLED", {}).get("href", "")
-                            if not led_href:
-                                continue
+                        button_id = int(match.group(1))
 
-                            send_json(sock, {
-                                "CommuniqueType": "ReadRequest",
-                                "Header": {"Url": f"{led_href}/status"}
-                            })
-                            led_resp = recv_json(sock)
-                            state = led_resp.get("Body", {}).get("LEDStatus", {}).get("State", "Unknown")
+                        send_json(sock, {
+                            "CommuniqueType": "ReadRequest",
+                            "Header": {"Url": f"/button/{button_id}"}
+                        })
+                        btn_detail = recv_json(sock) or {}
+                        button_body = ((btn_detail.get("Body") or {}).get("Button") or {})
+                        led_href = ((button_body.get("AssociatedLED") or {}).get("href") or "")
+                        if not led_href:
+                            continue
 
-                            device_statuses.append({
-                                "button_id": button_id,
-                                "status": "Locked" if state == "On" else "Unlocked" if state == "Off" else "Unknown"
-                            })
+                        send_json(sock, {
+                            "CommuniqueType": "ReadRequest",
+                            "Header": {"Url": f"{led_href}/status"}
+                        })
+                        led_resp = recv_json(sock) or {}
+                        state = ((led_resp.get("Body") or {}).get("LEDStatus") or {}).get("State", "Unknown")
+
+                        device_statuses.append({
+                            "button_id": button_id,
+                            "status": "Locked" if state == "On" else "Unlocked" if state == "Off" else "Unknown"
+                        })
+
+        return {"status": "success", "devices": device_statuses}
 
     except Exception as e:
         return {"status": "error", "message": f"Processor communication failed: {e}"}
-
-    return {"status": "success", "devices": device_statuses}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def toggle_device_lock_by_button(db, area, buttoncode: int):
@@ -78,52 +99,64 @@ def toggle_device_lock_by_button(db, area, buttoncode: int):
     if not processor:
         return {"status": "error", "message": "Processor not found"}
 
+    sock = None
     try:
-        with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as sock:
-            send_json(sock, {
-                "CommuniqueType": "ReadRequest",
-                "Header": {"Url": f"/button/{buttoncode}"}
-            })
-            btn_detail = recv_json(sock)
-            button_data = btn_detail.get("Body", {}).get("Button", {})
+        sock = create_ssl_connection(
+            processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+        )
+        if sock is None:
+            return {"status": "error", "message": "Processor communication failed: connection unavailable"}
 
-            engraving = button_data.get("Engraving", {}).get("Text", "").strip().lower()
-            if engraving not in ["lock/unlock", "device lock/unlock"]:
-                return {
-                    "status": "error",
-                    "message": "Invalid button. Only Lock/Unlock types allowed."
-                }
+        send_json(sock, {
+            "CommuniqueType": "ReadRequest",
+            "Header": {"Url": f"/button/{buttoncode}"}
+        })
+        btn_detail = recv_json(sock) or {}
+        button_data = (btn_detail.get("Body") or {}).get("Button") or {}
 
-            send_json(sock, {
-                "CommuniqueType": "CreateRequest",
-                "Header": {"Url": f"/button/{buttoncode}/commandprocessor"},
-                "Body": {
-                    "Command": {"CommandType": "PressAndRelease"}
-                }
-            })
-            _ = recv_json(sock)
-
-            led_href = button_data.get("AssociatedLED", {}).get("href", "")
-            if not led_href:
-                return {
-                    "status": "error",
-                    "message": "Associated LED not found for button"
-                }
-
-            send_json(sock, {
-                "CommuniqueType": "ReadRequest",
-                "Header": {"Url": f"{led_href}/status"}
-            })
-            led_resp = recv_json(sock)
-            state = led_resp.get("Body", {}).get("LEDStatus", {}).get("State", "Unknown")
-
+        engraving = _engraving_text(button_data)
+        if engraving not in ["lock/unlock", "device lock/unlock"]:
             return {
-                "status": "success",
-                "devices": [{
-                    "button_id": buttoncode,
-                    "status": "Locked" if state == "On" else "Unlocked" if state == "Off" else "Unknown"
-                }]
+                "status": "error",
+                "message": "Invalid button. Only Lock/Unlock types allowed."
             }
+
+        send_json(sock, {
+            "CommuniqueType": "CreateRequest",
+            "Header": {"Url": f"/button/{buttoncode}/commandprocessor"},
+            "Body": {
+                "Command": {"CommandType": "PressAndRelease"}
+            }
+        })
+        _ = recv_json(sock)
+
+        led_href = ((button_data.get("AssociatedLED") or {}).get("href") or "")
+        if not led_href:
+            return {
+                "status": "error",
+                "message": "Associated LED not found for button"
+            }
+
+        send_json(sock, {
+            "CommuniqueType": "ReadRequest",
+            "Header": {"Url": f"{led_href}/status"}
+        })
+        led_resp = recv_json(sock) or {}
+        state = ((led_resp.get("Body") or {}).get("LEDStatus") or {}).get("State", "Unknown")
+
+        return {
+            "status": "success",
+            "devices": [{
+                "button_id": buttoncode,
+                "status": "Locked" if state == "On" else "Unlocked" if state == "Off" else "Unknown"
+            }]
+        }
 
     except Exception as e:
         return {"status": "error", "message": f"Processor communication failed: {e}"}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass

@@ -171,10 +171,11 @@ os.makedirs(BACKGROUND_IMAGE_DIR, exist_ok=True)
 os.makedirs(LOGO_IMAGE_DIR, exist_ok=True)
 os.makedirs(HELP_FILES_DIR, exist_ok=True)
 
-app.mount("/floor_plans", StaticFiles(directory="app/floor_plans"), name="floor_plans")
 app.mount("/background_image", StaticFiles(directory=BACKGROUND_IMAGE_DIR), name="background_image")
 app.mount("/logo_image", StaticFiles(directory=LOGO_IMAGE_DIR), name="logo_image")
 app.mount("/help_files", StaticFiles(directory=HELP_FILES_DIR), name="help_files")
+# Floor plans are served only via authenticated GET /floor/{floor_id}/plan
+# (see app.api.routes.floor.download_floor_plan). Do not mount /floor_plans publicly.
 
 # -------------------- API Router -------------------- #
 app.include_router(api_router)

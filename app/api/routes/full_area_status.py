@@ -17,16 +17,13 @@ from app.crud.area_csv import generate_area_csv
 from app.schemas.area_csv import AreaCSVRequest
 from app.dependencies.permissions import require_operator_permission_for_scope
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
-from app.utils.lutron_helpers import is_processor_reachable
 from app.crud.area import (
     get_area_scene_summary_by_area_id,
     get_area_zones_with_status,
-    get_area_light_status,
-    get_area_occupancy_status,
     activate_scene_for_area,
     get_shade_zones_by_area,
-    get_area_energy_status,
     sync_area_names_for_floor,
+    assemble_full_area_status,
 )
 from app.utils.activity_report_logger import activity_report_log
 import json
@@ -41,50 +38,21 @@ def get_scene_zone_status_summary(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
+    """
+    Area sidebar payload (scenes + zones + light/occ/energy).
+
+    Uses a single LEAP socket for live reads when the processor is reachable,
+    with per-section DB cache fallback so one failure does not blank the
+    heatmap sidebar. Response shape is unchanged for all UI variants.
+    """
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:
         raise HTTPException(status_code=404, detail="Area not found in DB")
 
-    scene_result = get_area_scene_summary_by_area_id(db, area_id)
-    if scene_result["status"] != "success":
-        raise HTTPException(status_code=404, detail=f"Scene Error: {scene_result['message']}")
-
-    zone_result = get_area_zones_with_status(db, area_id)
-    if zone_result["status"] != "success":
-        raise HTTPException(status_code=404, detail=f"Zone Error: {zone_result['message']}")
-
-    light_result = get_area_light_status(db, area_id)
-    if light_result["status"] != "success":
-        raise HTTPException(status_code=404, detail=f"Light Error: {light_result['message']}")
-
-    occupancy_result = get_area_occupancy_status(db, area_id)
-    if occupancy_result["status"] != "success":
-        raise HTTPException(status_code=404, detail=f"Occupancy Error: {occupancy_result['message']}")
-
-    energy_result = get_area_energy_status(db, area_id)
-    if energy_result["status"] != "success":
-        consumption = "Unknown"
-        savings = "Unknown"
-    else:
-        c = energy_result["consumption"]
-        s = energy_result["savings"]
-        consumption = round(c, 2) if isinstance(c, (int, float)) else c
-        savings = round(s, 2) if isinstance(s, (int, float)) else s
-
-    return {
-        "status": "success",
-        "floor_id": area.floor_id,
-        "area_id": area.id,
-        "area_name": area.name,
-        "area_code": area.code,
-        "light_status": light_result["light_status"],
-        "occupancy_status": occupancy_result["occupancy_status"],
-        "active_scene": scene_result["active_scene"],
-        "area_scenes": scene_result["area_scenes"],
-        "zones": zone_result["zones"],
-        "consumption": consumption,
-        "savings": savings
-    }
+    result = assemble_full_area_status(db, area_id)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=404, detail=result.get("message") or "Area not found")
+    return result
 
 
 class SyncAreaNamesByFloorInput(BaseModel):
@@ -134,7 +102,10 @@ def get_scene_name_safe(processor: Processor, scene_code: int) -> str:
         response = recv_json(ssock)
         ssock.close()
 
-        area_scene = response.get("Body", {}).get("AreaScene", {})
+        if not isinstance(response, dict):
+            return f"Scene {scene_code}"
+
+        area_scene = (response.get("Body") or {}).get("AreaScene", {}) or {}
         if "Name" in area_scene:
             return area_scene["Name"]
         return f"Scene {scene_code}"

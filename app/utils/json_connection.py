@@ -124,7 +124,9 @@ def get_area_full_path_from_processor(ip: str, mac: str, system: str, area_code:
         while current_href:
             send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": current_href}})
             resp = recv_json(sock)
-            area = resp.get("Body", {}).get("Area")
+            if not isinstance(resp, dict):
+                break
+            area = (resp.get("Body") or {}).get("Area")
             if not area:
                 break
 
@@ -132,7 +134,8 @@ def get_area_full_path_from_processor(ip: str, mac: str, system: str, area_code:
             if name:
                 path_parts.insert(0, name)
 
-            parent_href = area.get("Parent", {}).get("href")
+            parent = area.get("Parent") or {}
+            parent_href = parent.get("href") if isinstance(parent, dict) else None
             current_href = parent_href if parent_href else None
 
         return "/".join(path_parts)

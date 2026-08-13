@@ -11,6 +11,7 @@ from pydantic import BaseModel,ValidationError
 
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query,Path,Body, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.dependencies.auth import get_current_user
@@ -40,6 +41,7 @@ from app.crud.floor_sort import (
 from app.crud.floor import (
     create_floor, get_area_light_status_by_floor,
     get_area_occupancy_status_by_floor, get_area_energy_status_by_floor,
+    get_floor_status_revision,
     modify_coordinates_in_db, generate_and_save_area_tree, update_floor_boundaries
 )
 from app.crud.occupancy_logs import track_floor_occupancy_logs
@@ -55,6 +57,10 @@ from app.models.user_model import UserPermission
 from app.models.zone import Zone
 from app.utils.processor_trim import fetch_zone_trims_from_processor
 from app.crud.zone_sync import sync_zones_for_floor
+from app.utils.floor_plan_media import (
+    floor_plan_client_url,
+    floor_plan_file_response_parts,
+)
 
 
 
@@ -63,6 +69,37 @@ router = APIRouter()
 # Ensure upload directory exists
 UPLOAD_DIR = os.path.join("app", "floor_plans")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+@router.get("/{floor_id}/plan")
+def download_floor_plan(
+    floor_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Stream floor plan file for authenticated users with floor access.
+    Replaces public StaticFiles /floor_plans/* so PDFs are not anonymously downloadable.
+    """
+    require_operator_permission_for_scope(
+        required_level=1,
+        floor_ids=[floor_id],
+        enforce_on_empty_scope=True,
+        db=db,
+        current_user=current_user,
+    )
+
+    floor = db.query(Floor).filter(Floor.id == floor_id).first()
+    if not floor:
+        raise HTTPException(status_code=404, detail="Floor not found")
+
+    disk_path, media_type, filename = floor_plan_file_response_parts(floor.image_path)
+    return FileResponse(
+        disk_path,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type="inline",
+    )
 
 
 def _energy_logger_manual_enabled() -> bool:
@@ -188,7 +225,7 @@ def _floor_to_dict(floor: Floor, processors: List[dict]) -> dict:
     return {
         "id": floor.id,
         "floor_name": floor.name,
-        "floor_image": floor.image_path,
+        "floor_image": floor_plan_client_url(floor.id),
         "processors": processors,
         "sort_order": floor.sort_order,
     }
@@ -349,7 +386,7 @@ async def upload_floor(
         return {
             "id": db_floor.id,
             "floor_name": db_floor.name,
-            "floor_image": image_path,
+            "floor_image": floor_plan_client_url(db_floor.id),
             "processors": processor_data,
             "sort_order": db_floor.sort_order,
         }
@@ -510,7 +547,7 @@ async def update_floor(
         return {
             "id": floor.id,
             "floor_name": floor.name,
-            "floor_image": floor.image_path,
+            "floor_image": floor_plan_client_url(floor.id),
             "processors": processor_data,
             "sort_order": floor.sort_order,
         }
@@ -648,7 +685,7 @@ def get_floor_by_id(
     return {
         "id": floor.id,
         "floor_name": floor.name,
-        "floor_image": floor.image_path,
+        "floor_image": floor_plan_client_url(floor.id),
         "processors": processor_data,
         "sort_order": floor.sort_order,
     }
@@ -787,6 +824,25 @@ def light_status(
     )
 
     result = get_area_light_status_by_floor(db, floor_id)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=404, detail=result.get("message", "Not found"))
+    return result
+
+
+@router.get("/status_revision")
+def status_revision(
+    floor_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_operator_permission_for_scope(
+        required_level=1,
+        floor_ids=[floor_id],
+        enforce_on_empty_scope=True,
+        db=db,
+        current_user=current_user,
+    )
+    result = get_floor_status_revision(db, floor_id)
     if result.get("status") != "success":
         raise HTTPException(status_code=404, detail=result.get("message", "Not found"))
     return result
