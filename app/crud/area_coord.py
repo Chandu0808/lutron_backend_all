@@ -7,8 +7,22 @@ from app.models.area import Area
 from app.models.coordinate import Coordinate
 from app.models.zone import Zone
 from app.models.processor import Processor
+from app.models.floor_proc_mapping import FloorProcMapping
 from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
+
+
+def _assign_floor_id_from_processor_mapping(db: Session, area: Area) -> None:
+    """If area has no floor, assign when the processor maps to exactly one floor."""
+    if area is None or area.floor_id is not None or area.processor_id is None:
+        return
+    mappings = (
+        db.query(FloorProcMapping)
+        .filter(FloorProcMapping.processor_id == area.processor_id)
+        .all()
+    )
+    if len(mappings) == 1:
+        area.floor_id = mappings[0].floor_id
 
 
 def upload_area_coordinates(file: UploadFile, db: Session, expected_processor_id: int | None = None):
@@ -61,6 +75,8 @@ def upload_area_coordinates(file: UploadFile, db: Session, expected_processor_id
                     db.add(Coordinate(area_id=area.id, x=x, y=y, polygon_index=polygon_index))
                 except ValueError:
                     continue
+
+        _assign_floor_id_from_processor_mapping(db, area)
 
         area_ids.append(area.id)
         processor_area_map[processor_id].append((code, area.id))
@@ -118,6 +134,26 @@ def upload_area_coordinates(file: UploadFile, db: Session, expected_processor_id
             ssock.close()
 
     db.commit()
+
+    # Refresh floor boundary boxes from the newly uploaded coordinates.
+    floor_ids = set()
+    if area_ids:
+        for (fid,) in (
+            db.query(Area.floor_id)
+            .filter(Area.id.in_(area_ids), Area.floor_id.isnot(None))
+            .distinct()
+            .all()
+        ):
+            floor_ids.add(fid)
+
+    if floor_ids:
+        from app.crud.floor import update_floor_boundaries
+
+        for floor_id in floor_ids:
+            try:
+                update_floor_boundaries(db, floor_id)
+            except Exception:
+                continue
 
     return {
         "status": "success",
