@@ -5,12 +5,14 @@ from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
 
+from app.crud.area import _leap_read_area_scenes, _upsert_area_scenes_cache
 from app.models.area import Area
 from app.models.floor import Floor
 from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.processor import Processor
 from app.models.zone import Zone
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
+from app.utils.logger import logger
 
 
 @dataclass
@@ -138,6 +140,26 @@ def apply_zone_metadata_for_area(
     return {"created": created, "updated": updated, "deleted": deleted}
 
 
+def _sync_area_scenes_best_effort(db: Session, ssock, area: Area) -> None:
+    """
+    Refresh cached scene list for one area from LEAP.
+
+    Best-effort only: zone sync should still succeed even if scene sync fails.
+    """
+    try:
+        scenes = _leap_read_area_scenes(ssock, area.code)
+        if scenes is None:
+            return
+        _upsert_area_scenes_cache(db, area.id, scenes)
+    except Exception as exc:
+        logger.warning(
+            "[Zone Sync] Scene sync skipped for area %s (%s): %s",
+            area.id,
+            area.code,
+            exc,
+        )
+
+
 def sync_zones_for_floor(db: Session, floor_id: int) -> dict[str, Any]:
     floor = db.query(Floor).filter(Floor.id == floor_id).first()
     if not floor:
@@ -235,6 +257,7 @@ def sync_zones_for_floor(db: Session, floor_id: int) -> dict[str, Any]:
 
                     counts = apply_zone_metadata_for_area(db=db, area=area, metadata_zones=parsed)
                     db.commit()  # commit after each area for partial success
+                    _sync_area_scenes_best_effort(db, ssock, area)
 
                     result.areas_synced += 1
                     result.zones_created += counts["created"]

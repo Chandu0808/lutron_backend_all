@@ -12,10 +12,12 @@ from pydantic import BaseModel,ValidationError
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query,Path,Body, status
 from fastapi.responses import FileResponse
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.dependencies.auth import get_current_user
-from app.database.session import get_db
+from app.database.session import get_db, engine
+from app.database.migrate_floor_sort_order import ensure_floor_sort_order_column
 from app.models.area import Area
 from app.models.coordinate import Coordinate
 from app.models.floor import Floor
@@ -41,7 +43,6 @@ from app.crud.floor_sort import (
 from app.crud.floor import (
     create_floor, get_area_light_status_by_floor,
     get_area_occupancy_status_by_floor, get_area_energy_status_by_floor,
-    get_floor_status_revision,
     modify_coordinates_in_db, generate_and_save_area_tree, update_floor_boundaries
 )
 from app.crud.occupancy_logs import track_floor_occupancy_logs
@@ -103,8 +104,9 @@ def download_floor_plan(
 
 
 def _energy_logger_manual_enabled() -> bool:
-    value = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower()
-    return value in ("true", "1", "yes")
+    from app.installation_config import is_energy_logger_manual
+
+    return is_energy_logger_manual()
 
 
 @router.post("/{floor_id}/sync-zones")
@@ -215,7 +217,7 @@ def _processors_for_floor(db: Session, floor_id: int) -> List[dict]:
             ).all()
             processors.append({
                 "processor_id": processor.id,
-                "server": processor.server,
+                "server": processor.server or "",
                 "areas": [{"area_id": a.id, "name": a.name} for a in areas],
             })
     return processors
@@ -225,9 +227,9 @@ def _floor_to_dict(floor: Floor, processors: List[dict]) -> dict:
     return {
         "id": floor.id,
         "floor_name": floor.name,
-        "floor_image": floor_plan_client_url(floor.id),
+        "floor_image": floor_plan_client_url(floor.id) or "",
         "processors": processors,
-        "sort_order": floor.sort_order,
+        "sort_order": getattr(floor, "sort_order", None),
     }
 
 
@@ -563,7 +565,12 @@ def list_floors(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    return _floor_list_response(db, current_user)
+    try:
+        return _floor_list_response(db, current_user)
+    except ProgrammingError:
+        db.rollback()
+        ensure_floor_sort_order_column(engine)
+        return _floor_list_response(db, current_user)
 
 
 @router.get("/sort-settings", response_model=FloorSortSettingsResponse)
@@ -779,6 +786,7 @@ def delete_floor(
 @router.get("/occupancy_status")
 def occupancy_status(
     floor_id: int,
+    live: int = Query(1, ge=0, le=1, description="1=LEAP then cache; 0=listener DB cache only"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -801,7 +809,7 @@ def occupancy_status(
         raise   # re-raise any other error (422, 500, etc.)
 
     #  Get occupancy status for this floor
-    result = get_area_occupancy_status_by_floor(db, floor_id)
+    result = get_area_occupancy_status_by_floor(db, floor_id, live=bool(live))
     if result["status"] != "success":
         raise HTTPException(status_code=404, detail=result.get("message", "Unknown error"))
     return result
@@ -811,6 +819,7 @@ def occupancy_status(
 @router.get("/light_status")
 def light_status(
     floor_id: int,
+    live: int = Query(1, ge=0, le=1, description="1=LEAP then cache; 0=listener DB cache only"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -823,26 +832,7 @@ def light_status(
         current_user=current_user,
     )
 
-    result = get_area_light_status_by_floor(db, floor_id)
-    if result.get("status") != "success":
-        raise HTTPException(status_code=404, detail=result.get("message", "Not found"))
-    return result
-
-
-@router.get("/status_revision")
-def status_revision(
-    floor_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    require_operator_permission_for_scope(
-        required_level=1,
-        floor_ids=[floor_id],
-        enforce_on_empty_scope=True,
-        db=db,
-        current_user=current_user,
-    )
-    result = get_floor_status_revision(db, floor_id)
+    result = get_area_light_status_by_floor(db, floor_id, live=bool(live))
     if result.get("status") != "success":
         raise HTTPException(status_code=404, detail=result.get("message", "Not found"))
     return result

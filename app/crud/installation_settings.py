@@ -10,14 +10,55 @@ SETTING_KEY_FEATURE_FLAGS = "feature_flags"
 SETTING_KEY_TIMEZONE = "timezone"
 SETTING_KEY_UI_PRESET = "ui_preset"
 SETTING_KEY_UI_VARIANT = "ui_variant"
+SETTING_KEY_UI_VARIANT_LOCKED = "ui_variant_locked"
 SETTING_KEY_FLOOR_MANUAL_SORT_ENABLED = "floor_manual_sort_enabled"
+SETTING_KEY_MONITORING_ENABLED = "monitoring_enabled"
+SETTING_KEY_MONITORING_INGEST_ENABLED = "monitoring_ingest_enabled"
+SETTING_KEY_MONITORING_LEAP_TELEMETRY = "monitoring_leap_telemetry"
+SETTING_KEY_MONITORING_HTTP_METRICS_ENABLED = "monitoring_http_metrics_enabled"
+SETTING_KEY_MONITORING_JOBS_ENABLED = "monitoring_jobs_enabled"
+SETTING_KEY_MONITORING_ALERTS_ENABLED = "monitoring_alerts_enabled"
+SETTING_KEY_MONITORING_ANALYTICS_ENABLED = "monitoring_analytics_enabled"
+SETTING_KEY_MONITORING_INGEST_TOKEN = "monitoring_ingest_token"
+SETTING_KEY_MONITORING_INGEST_URL = "monitoring_ingest_url"
+SETTING_KEY_ENERGY_LOGGER_MANUAL = "energy_logger_manual"
+
+DEFAULT_INGEST_URL = "http://127.0.0.1:8000/monitoring/ingest"
+DEFAULT_INGEST_TOKEN = "f2-test-ingest-secret"
 
 DEFAULT_SETTING_VALUES: Dict[str, Any] = {
     SETTING_KEY_FEATURE_FLAGS: {},
     SETTING_KEY_TIMEZONE: "UTC",
     SETTING_KEY_UI_PRESET: None,
     SETTING_KEY_UI_VARIANT: "basic",
+    SETTING_KEY_UI_VARIANT_LOCKED: False,
     SETTING_KEY_FLOOR_MANUAL_SORT_ENABLED: False,
+    SETTING_KEY_MONITORING_ENABLED: True,
+    SETTING_KEY_MONITORING_INGEST_ENABLED: True,
+    SETTING_KEY_MONITORING_LEAP_TELEMETRY: True,
+    SETTING_KEY_MONITORING_HTTP_METRICS_ENABLED: True,
+    SETTING_KEY_MONITORING_JOBS_ENABLED: True,
+    SETTING_KEY_MONITORING_ALERTS_ENABLED: True,
+    SETTING_KEY_MONITORING_ANALYTICS_ENABLED: True,
+    SETTING_KEY_MONITORING_INGEST_TOKEN: DEFAULT_INGEST_TOKEN,
+    SETTING_KEY_MONITORING_INGEST_URL: DEFAULT_INGEST_URL,
+    SETTING_KEY_ENERGY_LOGGER_MANUAL: False,
+}
+
+RUNTIME_BOOL_SETTING_DEFAULTS: Dict[str, bool] = {
+    SETTING_KEY_MONITORING_ENABLED: True,
+    SETTING_KEY_MONITORING_INGEST_ENABLED: True,
+    SETTING_KEY_MONITORING_LEAP_TELEMETRY: True,
+    SETTING_KEY_MONITORING_HTTP_METRICS_ENABLED: True,
+    SETTING_KEY_MONITORING_JOBS_ENABLED: True,
+    SETTING_KEY_MONITORING_ALERTS_ENABLED: True,
+    SETTING_KEY_MONITORING_ANALYTICS_ENABLED: True,
+    SETTING_KEY_ENERGY_LOGGER_MANUAL: False,
+}
+
+RUNTIME_STRING_SETTING_DEFAULTS: Dict[str, str] = {
+    SETTING_KEY_MONITORING_INGEST_TOKEN: DEFAULT_INGEST_TOKEN,
+    SETTING_KEY_MONITORING_INGEST_URL: DEFAULT_INGEST_URL,
 }
 
 
@@ -88,6 +129,34 @@ def validate_setting_key(setting_key: str) -> str:
     if len(key) > 64:
         raise ValueError("setting_key must be at most 64 characters")
     return key
+
+
+def seed_installation_runtime_defaults(
+    db: Optional[Session] = None,
+    *,
+    updated_by: Optional[int] = None,
+) -> List[str]:
+    """Insert missing monitoring / energy-logger settings only (never overwrite)."""
+    from app.database.session import SessionLocal
+
+    owns_session = db is None
+    session = db if db is not None else SessionLocal()
+    inserted: List[str] = []
+    try:
+        for key, value in RUNTIME_BOOL_SETTING_DEFAULTS.items():
+            if get_setting(session, key) is not None:
+                continue
+            upsert_setting(session, key, bool(value), updated_by=updated_by)
+            inserted.append(key)
+        for key, value in RUNTIME_STRING_SETTING_DEFAULTS.items():
+            if get_setting(session, key) is not None:
+                continue
+            upsert_setting(session, key, str(value), updated_by=updated_by)
+            inserted.append(key)
+    finally:
+        if owns_session:
+            session.close()
+    return inserted
 
 
 def get_settings_map(db: Session) -> Dict[str, Any]:

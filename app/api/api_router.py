@@ -10,6 +10,8 @@ from app.api.routes import (
     installation_config,
     widget_configuration_api,
     dashboard_layout_api,
+    monitoring,
+    monitoring_dashboard,
 )
 
 api_router = APIRouter()
@@ -71,3 +73,12 @@ api_router.include_router(reconciliation.router, prefix="", tags=["Reconciliatio
 
 # -------------------- FOFP (Floor Overlay / Floorplan Positioning) -------------------- #
 api_router.include_router(fofp.router, prefix="/fofp", tags=["FOFP"])
+
+# -------------------- Monitoring -------------------- #
+# Dashboard first so /jobs and /pipeline use dashboard read models.
+api_router.include_router(
+    monitoring_dashboard.router,
+    prefix="/monitoring",
+    tags=["Monitoring Dashboard"],
+)
+api_router.include_router(monitoring.router, prefix="/monitoring", tags=["Monitoring"])

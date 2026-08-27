@@ -14,6 +14,7 @@ from app.models.floor_proc_mapping import FloorProcMapping
 from app.models.sensors_and_modules import SensorAndModule
 from app.models.alert_type_display_settings import AlertTypeDisplaySetting
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
+from app.utils.alert_area_path import AreaPathResolver, sanitize_stored_path, area_alert_scope
 from app.crud.schedule import fetch_combined_schedules
 from app.crud.alert_reconciliation import (
     active_device_filter_clauses,
@@ -101,6 +102,7 @@ def get_active_alerts_list_for_dashboard(
         ]
 
     type_display_map = _get_alert_type_display_map(db)
+    path_resolver = AreaPathResolver(db)
 
     # Processor Alerts
     if type_display_map.get("Processor Not Responding", True):
@@ -114,19 +116,29 @@ def get_active_alerts_list_for_dashboard(
         for p in q_processors.all():
             location = None
             if p.associated_area:
-                area_code = p.associated_area.split("/")[-1] if "/" in p.associated_area else p.associated_area
-                area = db.query(Area).filter(Area.code == area_code, Area.processor_id == p.id).first()
-                if area:
-                    location_parts = []
-                    if area.floor and area.floor.name:
-                        location_parts.append(area.floor.name)
-                    if area.name:
-                        location_parts.append(area.name)
-                    location = "/".join(location_parts) if location_parts else None
-                else:
-                    location = _get_area_full_path_from_processor(p.ipv4, p.mac, p.system, area_code)
+                area_code = (
+                    p.associated_area.split("/")[-1]
+                    if "/" in p.associated_area
+                    else p.associated_area
+                )
+                area = db.query(Area).filter(
+                    Area.code == area_code, Area.processor_id == p.id
+                ).first()
+                scope = area_alert_scope(area, area_code=area_code)
+                location = path_resolver.resolve(
+                    area, None, area_code=scope["area_code"]
+                )
+                if not location:
+                    location = sanitize_stored_path(
+                        _get_area_full_path_from_processor(
+                            p.ipv4, p.mac, p.system, area_code
+                        )
+                    )
+            else:
+                scope = area_alert_scope(None)
             results.append({
                 "location": location,
+                **scope,
                 "alert_type": "processor not responding",
                 "device_name": p.system,
                 "serial_no": p.serial,
@@ -140,31 +152,42 @@ def get_active_alerts_list_for_dashboard(
 
     # Device Alerts
     if type_display_map.get("Device Not Responding", True):
+        from app.utils.system_identity import (
+            heal_duplicate_active_device_alerts,
+            partition_active_device_alert_duplicates,
+            processor_system_key_map,
+        )
+
+        try:
+            healed = heal_duplicate_active_device_alerts(db)
+            if healed:
+                db.commit()
+        except Exception:
+            db.rollback()
+
         bad_devices = db.query(SensorAndModule).filter(
             *active_device_filter_clauses(),
         ).all()
-        for dev in bad_devices:
-            location = None
-            area = None
-            if dev.area_id:
-                area = db.query(Area).filter(Area.id == dev.area_id).first()
+        survivors, _losers = partition_active_device_alert_duplicates(
+            bad_devices, processor_system_key_map(db)
+        )
+        for dev in survivors:
+            area = path_resolver.get_area(dev.area_id) if dev.area_id else None
+            if area is None and getattr(dev, "area_code", None):
+                area = path_resolver.get_area_by_code(
+                    dev.area_code, getattr(dev, "processor_id", None)
+                )
             if area and getattr(current_user, "role", None) == "Operator" and area.floor_id not in allowed_floor_ids:
                 continue
-            if area:
-                location_parts = []
-                if area.floor and area.floor.name:
-                    location_parts.append(area.floor.name)
-                if area.name:
-                    location_parts.append(area.name)
-                location = "/".join(location_parts) if location_parts else None
-            elif getattr(dev, "area_code", None) and getattr(dev, "processor_id", None):
-                proc = db.query(Processor).filter(Processor.id == dev.processor_id).first()
-                if proc:
-                    location = _get_area_full_path_from_processor(
-                        proc.ipv4, proc.mac, proc.system, str(dev.area_code)
-                    )
+            scope = area_alert_scope(
+                area, area_id=dev.area_id, area_code=dev.area_code
+            )
+            location = path_resolver.resolve(
+                area, getattr(dev, "area_path", None), area_code=scope["area_code"]
+            )
             results.append({
                 "location": location,
+                **scope,
                 "alert_type": "Device Not Responding",
                 "device_name": dev.device_name,
                 "serial_no": dev.serial_number,
@@ -182,30 +205,23 @@ def get_active_alerts_list_for_dashboard(
         *active_driver_filter_clauses(),
     ).all()
     for d in drivers:
-        location = None
-        area = None
-        if d.area_id:
-            area = db.query(Area).filter(Area.id == d.area_id).first()
+        area = path_resolver.get_area(d.area_id) if d.area_id else None
+        if area is None and getattr(d, "area_code", None):
+            area = path_resolver.get_area_by_code(
+                d.area_code, getattr(d, "processor_id", None)
+            )
         if area and getattr(current_user, "role", None) == "Operator" and area.floor_id not in allowed_floor_ids:
             continue
         alert_type = driver_types.get(d.error_code, "Other Warnings")
         if not type_display_map.get(alert_type, True):
             continue
-        if area:
-            location_parts = []
-            if area.floor and area.floor.name:
-                location_parts.append(area.floor.name)
-            if area.name:
-                location_parts.append(area.name)
-            location = "/".join(location_parts) if location_parts else None
-        elif getattr(d, "area_code", None) and getattr(d, "processor_id", None):
-            proc = db.query(Processor).filter(Processor.id == d.processor_id).first()
-            if proc:
-                location = _get_area_full_path_from_processor(
-                    proc.ipv4, proc.mac, proc.system, str(d.area_code)
-                )
+        scope = area_alert_scope(area, area_id=d.area_id, area_code=d.area_code)
+        location = path_resolver.resolve(
+            area, getattr(d, "area_path", None), area_code=scope["area_code"]
+        )
         results.append({
             "location": location,
+            **scope,
             "alert_type": alert_type,
             "device_name": d.device_name,
             "serial_no": getattr(d, "serial_number", None),

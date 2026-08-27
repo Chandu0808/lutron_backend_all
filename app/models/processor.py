@@ -41,5 +41,9 @@ class Processor(Base):
     # Handshake status
     handshake_status = Column(Boolean, nullable=True, default=None)  # None=not attempted, True=success, False=failed
 
+    # Project identity — shared across Athena processors in the same /project
+    system_key = Column(String, nullable=True, index=True)
+    project_name = Column(String, nullable=True)
+
     areas = relationship("Area", back_populates="processor")
     zones = relationship("Zone", back_populates="processor")

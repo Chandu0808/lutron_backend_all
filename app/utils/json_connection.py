@@ -3,6 +3,7 @@
 import orjson
 import ssl
 import socket
+import time
 from app.utils.definitions import (
     LEAP_PRIVATE_KEY_FILE,
     LEAP_SIGNED_CSR_FILE,
@@ -15,22 +16,22 @@ CRLF = b"\r\n"
 MAX_READ_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
-def create_ssl_connection(ip: str, mac: str, system: str, processor_ipv4: str = None, port: int = 8081, timeout: int = 5):
+def create_ssl_connection(
+    ip: str,
+    mac: str,
+    system: str,
+    processor_ipv4: str = None,
+    port: int = 8081,
+    timeout: int = 5,
+    processor_id: int = None,
+):
     """
     Establish SSL connection to Lutron processor using processor-specific certificates.
-    
-    Args:
-        ip: Processor IPv4 address
-        mac: Processor MAC address
-        system: Processor system type
-        processor_ipv4: IPv4 to determine certificate folder (REQUIRED for multi-processor)
-        port: Connection port (default: 8081)
-        timeout: Connection timeout in seconds
     """
+    t0 = time.perf_counter()
     try:
         hostname = get_proc_hostname(system, mac)
         
-        # Get processor-specific certificate paths
         cert_paths = get_processor_cert_paths(processor_ipv4)
 
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -40,26 +41,59 @@ def create_ssl_connection(ip: str, mac: str, system: str, processor_ipv4: str = 
         context.load_cert_chain(certfile=cert_paths['leap_signed_csr'], keyfile=cert_paths['leap_private_key'])
 
         raw_sock = socket.create_connection((ip, port), timeout=timeout)
-        return context.wrap_socket(raw_sock, server_hostname=hostname)
+        sock = context.wrap_socket(raw_sock, server_hostname=hostname)
+        try:
+            from app.monitoring.leap_connection_limits import report_connect_outcome
+
+            report_connect_outcome(
+                success=True,
+                processor_id=processor_id,
+                ipv4=processor_ipv4 or ip,
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
+                source="json_connection",
+            )
+        except Exception:
+            pass
+        return sock
     except Exception as e:
         print(f"[SSL CONNECTION ERROR] {ip}: {e}")
+        try:
+            from app.monitoring.leap_connection_limits import report_connect_outcome
+
+            report_connect_outcome(
+                success=False,
+                processor_id=processor_id,
+                ipv4=processor_ipv4 or ip,
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
+                error=e,
+                source="json_connection",
+            )
+        except Exception:
+            pass
         return None
 
 
-def connect_to_processor(ip: str, mac: str, system: str, processor_ipv4: str = None, port: int = 8081, timeout: int = 5):
+def connect_to_processor(
+    ip: str,
+    mac: str,
+    system: str,
+    processor_ipv4: str = None,
+    port: int = 8081,
+    timeout: int = 5,
+    processor_id: int = None,
+):
     """
     Helper function to simplify processor connection using identity info.
-    Internally calls create_ssl_connection and returns the SSL-wrapped socket.
-    
-    Args:
-        ip: Processor IPv4 address
-        mac: Processor MAC address
-        system: Processor system type
-        processor_ipv4: IPv4 to determine certificate folder (REQUIRED for multi-processor)
-        port: Connection port (default: 8081)
-        timeout: Connection timeout in seconds
     """
-    return create_ssl_connection(ip=ip, mac=mac, system=system, processor_ipv4=processor_ipv4, port=port, timeout=timeout)
+    return create_ssl_connection(
+        ip=ip,
+        mac=mac,
+        system=system,
+        processor_ipv4=processor_ipv4,
+        port=port,
+        timeout=timeout,
+        processor_id=processor_id,
+    )
 
 
 def send_json(sock, data: dict):
@@ -72,7 +106,7 @@ def send_json(sock, data: dict):
         print(f"[SEND ERROR] {e}")
 
 
-def recv_json(sock):
+def recv_json(sock, *, processor_id: int = None):
     """
     Receive JSON response from socket until CRLF.
     Returns parsed dict or None on failure.
@@ -89,7 +123,19 @@ def recv_json(sock):
                 break
 
         first = buffer.split(CRLF)[0].strip()
-        return orjson.loads(first)
+        parsed = orjson.loads(first)
+        try:
+            from app.monitoring.leap_connection_limits import report_leap_header_status
+
+            if isinstance(parsed, dict):
+                report_leap_header_status(
+                    processor_id=processor_id,
+                    header=parsed.get("Header"),
+                    source="json_connection.recv_json",
+                )
+        except Exception:
+            pass
+        return parsed
     except orjson.JSONDecodeError as e:
         print(f"[DECODE ERROR] {e}")
     except Exception as e:

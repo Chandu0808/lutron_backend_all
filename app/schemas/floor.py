@@ -15,7 +15,7 @@ class AreaOut(BaseModel):
 
 class ProcessorFloorOut(BaseModel):
     processor_id: int
-    server: str
+    server: Optional[str] = ""
     areas: List[AreaOut]
 
     class Config:
@@ -24,7 +24,7 @@ class ProcessorFloorOut(BaseModel):
 class FloorListOut(BaseModel):
     id: int
     floor_name: str
-    floor_image: str
+    floor_image: Optional[str] = ""
     processors: List[ProcessorFloorOut]  # Use renamed model
     sort_order: Optional[int] = None
 

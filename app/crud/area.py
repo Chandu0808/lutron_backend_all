@@ -333,6 +333,58 @@ def _lutron_zone_code_from_href(href: Optional[str]) -> Optional[int]:
         return None
 
 
+def _parse_live_zone_levels_from_status_resp(status_resp) -> Dict[int, Dict[str, Any]]:
+    """Map Lutron zone code -> {level, kelvin} from LEAP /associatedzone/status."""
+    out: Dict[int, Dict[str, Any]] = {}
+    if not isinstance(status_resp, dict):
+        return out
+    for status in (status_resp.get("Body") or {}).get("ZoneStatuses", []) or []:
+        zone_href = ((status.get("Zone") or {}).get("href") or "")
+        zone_code = _lutron_zone_code_from_href(zone_href)
+        if zone_code is None:
+            try:
+                zone_code = int(str(zone_href).rstrip("/").split("/")[-1])
+            except (TypeError, ValueError):
+                continue
+        kelvin = None
+        cts = status.get("ColorTuningStatus") or {}
+        wtl = cts.get("WhiteTuningLevel") if isinstance(cts, dict) else None
+        if isinstance(wtl, dict):
+            kelvin = wtl.get("Kelvin")
+        out[zone_code] = {"level": status.get("Level", 0), "kelvin": kelvin}
+    return out
+
+
+def _overlay_live_zone_levels_on_zones(
+    zones: List[Dict[str, Any]],
+    live_by_code: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Apply live LEAP levels onto DB-backed zone rows (same ids, names, types)."""
+    if not live_by_code or not zones:
+        return zones
+    result = []
+    for z in zones:
+        zid = z.get("id")
+        try:
+            code = int(zid) if zid is not None else None
+        except (TypeError, ValueError):
+            code = None
+        live = live_by_code.get(code) if code is not None else None
+        if live is None:
+            result.append(z)
+            continue
+        result.append(
+            _enrich_zone_from_level(
+                zid,
+                z.get("name"),
+                z.get("type"),
+                live.get("level"),
+                live.get("kelvin"),
+            )
+        )
+    return result
+
+
 def _fofp_status_from_level(level: int) -> Dict[str, Any]:
     """Wire-format light fields for FOFP markers from a 0-100 level."""
     if level <= 0:
@@ -588,12 +640,17 @@ def get_area_occupancy_status(db: Session, area_id: int):
         return {"status": "error", "message": str(e)}
 
 
-def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
+def assemble_full_area_status(db: Session, area_id: int, live: bool = True) -> Dict[str, Any]:
     """
-    Single-socket LEAP assembly for heatmap sidebar.
-    Energy always from DB. Scenes list / zones / light / occ use one connection when
-    reachable, with per-section DB cache fallback. active_scene is live LEAP
-    CurrentScene only (null if missing) so the UI does not highlight a stale scene.
+    Heatmap sidebar payload (scenes + zones + light/occ/energy).
+
+    live=True (default): zone list (names/types) from DB sync cache with live levels
+    overlaid from LEAP; area_scenes refreshed from LEAP /areascene when the processor
+    is reachable (then cached), otherwise DB cache; active_scene, light, occupancy
+    from LEAP when reachable. active_scene is live CurrentScene only (null if missing).
+
+    live=False: listener/DB cache only — no LEAP SSL. Energy always from DB.
+
     Response shape matches the existing /area/full_area_status wire format.
     """
     area = db.query(Area).filter(Area.id == area_id).first()
@@ -614,9 +671,9 @@ def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
 
     area_scenes = _scenes_from_db_cache(db, area_id)
     # LMS-style: highlight only from live LEAP CurrentScene (null = no button selected).
-    # Do not seed from DB cache — stale current_scene_code (e.g. OFF) caused false highlights
-    # while zones/light were On.
-    active_scene = None
+    # Do not seed from DB cache on live path — stale current_scene_code (e.g. OFF) caused
+    # false highlights while zones/light were On. Cache polls (live=False) do use cache.
+    active_scene = _active_scene_from_cache(db, area_id) if not live else None
     zones = _zones_from_db_cache(db, area_id)
     light_status = _area_light_from_cache(db, area_id) or "Unknown"
     occupancy_status = _area_occupancy_from_cache(db, area_id) or "Unknown"
@@ -637,6 +694,9 @@ def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
             "savings": savings,
         }
 
+    if not live:
+        return _payload()
+
     if not processor or not is_processor_reachable(processor.ipv4):
         logger.warning(
             f"[Full Area Status] Processor unreachable for area {area_id}; serving cache"
@@ -650,37 +710,6 @@ def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
         )
         if ssock is None:
             return _payload()
-
-        # --- Scenes (same socket; one reconnect retry on transport fail) ---
-        parsed = None
-        try:
-            parsed = _leap_read_area_scenes(ssock, area.code)
-        except Exception as e:
-            logger.warning(f"[Full Area Status] Scenes read failed area {area_id}: {e}")
-            parsed = None
-
-        if parsed is None and area.code:
-            logger.warning(f"[Full Area Status] Scenes LEAP retry area {area_id}")
-            try:
-                if ssock is not None:
-                    try:
-                        ssock.close()
-                    except Exception:
-                        pass
-                    ssock = None
-                ssock = connect_to_processor(
-                    processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
-                )
-                if ssock is not None:
-                    parsed = _leap_read_area_scenes(ssock, area.code)
-            except Exception as e:
-                logger.warning(f"[Full Area Status] Scenes retry failed area {area_id}: {e}")
-                parsed = None
-
-        if parsed is not None:
-            # Successful LEAP for this area_id only: [] is valid (no programmed scenes).
-            area_scenes = parsed
-            _upsert_area_scenes_cache(db, area_id, area_scenes)
 
         # --- Area status: light + occupancy + active scene (one read) ---
         try:
@@ -708,60 +737,28 @@ def assemble_full_area_status(db: Session, area_id: int) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"[Full Area Status] Area status read failed area {area_id}: {e}")
 
-        # --- Zones metadata + status (same socket) ---
+        # --- Scene list: live refresh (same idea as zone levels) so sidebar is not empty
+        # when area_scenes cache was never filled (e.g. new deployment before floor sync).
         try:
-            send_json(ssock, {
-                "CommuniqueType": "ReadRequest",
-                "Header": {"Url": f"/area/{area.code}/associatedzone"}
-            })
-            metadata_resp = recv_json(ssock)
-            zone_meta_map = {}
-            if isinstance(metadata_resp, dict):
-                for zone in (metadata_resp.get("Body") or {}).get("Zones", []) or []:
-                    try:
-                        zid = int(str(zone.get("href", "")).rstrip("/").split("/")[-1])
-                    except (TypeError, ValueError):
-                        continue
-                    zone_meta_map[zid] = {
-                        "name": zone.get("Name", f"Zone {zid}"),
-                        "type": zone.get("ControlType", "Unknown"),
-                    }
+            leap_scenes = _leap_read_area_scenes(ssock, area.code)
+            if leap_scenes is not None:
+                _upsert_area_scenes_cache(db, area_id, leap_scenes)
+                area_scenes = leap_scenes
+        except Exception as e:
+            logger.warning(f"[Full Area Status] Scene list read failed area {area_id}: {e}")
 
+        # --- Zone levels: live overlay on DB zone list (names/types from sync) ---
+        try:
             send_json(ssock, {
                 "CommuniqueType": "ReadRequest",
                 "Header": {"Url": f"/area/{area.code}/associatedzone/status"}
             })
             status_resp = recv_json(ssock)
-            if isinstance(status_resp, dict):
-                enriched_zones = []
-                for status in (status_resp.get("Body") or {}).get("ZoneStatuses", []) or []:
-                    zone_href = ((status.get("Zone") or {}).get("href") or "")
-                    try:
-                        zone_id = int(str(zone_href).rstrip("/").split("/")[-1]) if zone_href else None
-                    except (TypeError, ValueError):
-                        zone_id = None
-                    if zone_id is None:
-                        continue
-                    level = status.get("Level", 0)
-                    meta = zone_meta_map.get(zone_id, {})
-                    kelvin = None
-                    cts = status.get("ColorTuningStatus") or {}
-                    wtl = cts.get("WhiteTuningLevel") if isinstance(cts, dict) else None
-                    if isinstance(wtl, dict):
-                        kelvin = wtl.get("Kelvin")
-                    enriched_zones.append(
-                        _enrich_zone_from_level(
-                            zone_id,
-                            meta.get("name", f"Zone {zone_id}"),
-                            meta.get("type", "Unknown"),
-                            level,
-                            kelvin,
-                        )
-                    )
-                if enriched_zones:
-                    zones = enriched_zones
+            live_by_code = _parse_live_zone_levels_from_status_resp(status_resp)
+            if live_by_code:
+                zones = _overlay_live_zone_levels_on_zones(zones, live_by_code)
         except Exception as e:
-            logger.warning(f"[Full Area Status] Zones read failed area {area_id}: {e}")
+            logger.warning(f"[Full Area Status] Zone status read failed area {area_id}: {e}")
 
     except Exception as e:
         logger.exception(f"[Full Area Status] LEAP assembly failed area {area_id}: {e}")

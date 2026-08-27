@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+websockets
 sqlalchemy
 psycopg2-binary
 python-jose[cryptography]
@@ -13,9 +14,11 @@ python-multipart
 jose
 orjson
 apscheduler
+psutil>=5.9.0
 pytz
 pydantic[email]
 pandas
 openpyxl
 natsort
 pytest>=7.0.0
+httpx
