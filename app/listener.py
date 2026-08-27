@@ -4,6 +4,7 @@ import asyncio
 import logging
 import traceback
 import os
+import time
 from asyncio import StreamReader, StreamWriter
 
 from app.database.session import SessionLocal, engine
@@ -42,10 +43,29 @@ shutdown_event = asyncio.Event()
 CRLF = b"\r\n"
 
 
+def _mon_note_stream(processor_id, stream, *, event=False, subscribed=None):
+    try:
+        from app.monitoring.stream_health import note_stream
+
+        note_stream(
+            int(processor_id),
+            stream,
+            event=event,
+            subscribed=subscribed,
+        )
+    except Exception:
+        pass
+
+
 def _energy_logger_manual() -> bool:
     """True when manual energy logger is enabled (power from zones, not processor area events)."""
-    v = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower()
-    return v in ("true", "1", "yes")
+    try:
+        from app.installation_config import is_energy_logger_manual
+
+        return is_energy_logger_manual()
+    except Exception:
+        v = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower()
+        return v in ("true", "1", "yes")
 
 
 def _rollup_current_area_power_from_zones(db, processor_id: int) -> None:
@@ -128,7 +148,12 @@ logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs")
 def get_processor_logger(processor_id):
     """Get or create a logger for a specific processor (console output only, file logging disabled)"""
     if processor_id in processor_loggers:
-        return processor_loggers[processor_id]
+        logger = processor_loggers[processor_id]
+        # Keep production floor at WARNING even if an older handler was cached.
+        logger.setLevel(logging.WARNING)
+        for handler in logger.handlers:
+            handler.setLevel(logging.WARNING)
+        return logger
     
     # File logging disabled - removed logs directory creation and file handler
     # Ensure logs directory exists
@@ -136,7 +161,8 @@ def get_processor_logger(processor_id):
     
     # Create logger for this processor
     logger = logging.getLogger(f"listener_processor_{processor_id}")
-    logger.setLevel(logging.INFO)
+    # Production: only WARN/ERROR on console (no per-message INFO dumps).
+    logger.setLevel(logging.WARNING)
     logger.propagate = False
     logger.handlers.clear()
     
@@ -149,9 +175,9 @@ def get_processor_logger(processor_id):
     # file_handler.setFormatter(file_formatter)
     # logger.addHandler(file_handler)
     
-    # Console handler - also log to console
+    # Console handler - WARN/ERROR only
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(file_formatter)
     logger.addHandler(console_handler)
     
@@ -265,6 +291,8 @@ async def discover_and_subscribe_buttons(reader: StreamReader, writer: StreamWri
             "CommuniqueType": "SubscribeRequest",
             "Header": {"Url": url}
         })
+    _mon_note_stream(processor_id, "area", subscribed=True)
+    _mon_note_stream(processor_id, "zone", subscribed=True)
 
     # Subscribe to each button's status event
     for btn in sorted(buttons):
@@ -572,20 +600,8 @@ def check_area_occupancy(msg, db, processor_id):
     global recent_button_event
 
     area_statuses = msg.get("AreaStatuses", [])
-    if area_statuses:
-        log_processor(processor_id, f"Received area status for processor {processor_id}: {len(area_statuses)} areas")
 
     for area_status in area_statuses:
-        # Log the complete area_status data for this processor
-        try:
-            area_status_json = json.dumps(area_status, indent=2, default=str)
-            log_processor(processor_id, f"Area Status (Area Code: {area_status.get('href', 'Unknown')}):")
-            for line in area_status_json.split('\n'):
-                if line.strip():  # Only log non-empty lines
-                    log_processor(processor_id, line)
-        except Exception as e:
-            log_processor(processor_id, f"Failed to log area_status: {e}", level=logging.ERROR)
-        
         href = area_status.get("href")
         code = int(href.strip("/").split("/")[-2]) if href else None
         area = db.query(Area).filter_by(code=str(code), processor_id=processor_id).first()
@@ -651,13 +667,6 @@ def check_area_occupancy(msg, db, processor_id):
         # ---------- Energy Saving Strategy ----------
         instantaneous_power = area_status.get("InstantaneousPower")
         instantaneous_max_power = area_status.get("InstantaneousMaxPower")
-
-        # Log power data status
-        if instantaneous_power is not None or instantaneous_max_power is not None:
-            log_processor(processor_id, f"Processor {processor_id}, Area {code}: Power={instantaneous_power}, MaxPower={instantaneous_max_power}")
-        elif code is not None:
-            # Show the actual values even when both are None
-            log_processor(processor_id, f"Processor {processor_id}, Area {code}: NO POWER DATA - InstantaneousPower={instantaneous_power}, InstantaneousMaxPower={instantaneous_max_power} (will be skipped by energy logger)")
 
         if instantaneous_power is not None and instantaneous_max_power is not None:
             chosen_report, strategy_type = classify_strategy_for_area(db, code, processor_id)
@@ -793,6 +802,14 @@ def check_area_occupancy(msg, db, processor_id):
                 db.add(current)
 
             db.commit()
+
+            if area and area.floor_id:
+                try:
+                    from app.heatmap.live_notify import publish_heatmap_live_event
+
+                    publish_heatmap_live_event(floor_id=area.floor_id, area_id=area.id)
+                except Exception:
+                    pass
 
             # ---------- STEP 4: Activity Logging (Unchanged) ----------
             if old_occupancy != current.occupancy_status:
@@ -1006,6 +1023,19 @@ def check_zone_status(msg, db, processor_id):
                     **{k: v for k, v in fields.items() if v is not None}
                 ))
             db.commit()
+            if zone_obj and zone_obj.area_id:
+                try:
+                    from app.models.area import Area
+                    from app.heatmap.live_notify import publish_heatmap_live_event
+
+                    area_row = db.query(Area).filter(Area.id == zone_obj.area_id).first()
+                    if area_row and area_row.floor_id:
+                        publish_heatmap_live_event(
+                            floor_id=area_row.floor_id,
+                            area_id=area_row.id,
+                        )
+                except Exception:
+                    pass
         except Exception:
             db.rollback()
     if manual and zone_statuses:
@@ -1020,20 +1050,84 @@ async def unified_listener(reader, writer, db, processor_id):
     global recent_button_event
     first_area_message = True
     first_zone_message = True
+    pending_ping_sent_at = None
+    ping_failure_emitted = False
 
     async def send_ping():
+        nonlocal pending_ping_sent_at, ping_failure_emitted
         while not shutdown_event.is_set():
             await asyncio.sleep(30)
-            await _send_json(writer, {
-                "CommuniqueType": "ReadRequest",
-                "Header": {"URL": "/server/status/ping"}
-            })
+            pending_ping_sent_at = time.monotonic()
+            ping_failure_emitted = False
+            try:
+                await _send_json(writer, {
+                    "CommuniqueType": "ReadRequest",
+                    "Header": {"URL": "/server/status/ping"}
+                })
+            except Exception as ping_send_err:
+                try:
+                    from app.monitoring.leap_telemetry import report_leap_ping
+
+                    report_leap_ping(
+                        processor_id,
+                        success=False,
+                        detail={"reason": "send_failed", "error": str(ping_send_err)},
+                    )
+                except Exception:
+                    pass
+                pending_ping_sent_at = None
+
+    async def watch_ping_timeout():
+        nonlocal pending_ping_sent_at, ping_failure_emitted
+        try:
+            from app.monitoring.leap_telemetry import ping_timeout_seconds, report_leap_ping
+        except Exception:
+            return
+        timeout_s = ping_timeout_seconds()
+        while not shutdown_event.is_set():
+            await asyncio.sleep(1)
+            sent = pending_ping_sent_at
+            if sent is None or ping_failure_emitted:
+                continue
+            if (time.monotonic() - sent) >= timeout_s:
+                ping_failure_emitted = True
+                pending_ping_sent_at = None
+                try:
+                    report_leap_ping(
+                        processor_id,
+                        success=False,
+                        detail={"reason": "timeout", "timeout_seconds": timeout_s},
+                    )
+                except Exception:
+                    pass
 
     asyncio.create_task(send_ping())
+    asyncio.create_task(watch_ping_timeout())
+
+    def _emit_processor_down(reason: str, error=None) -> None:
+        try:
+            from app.monitoring.leap_telemetry import report_connectivity
+
+            detail = {"reason": reason}
+            if error:
+                detail["error"] = error
+            report_connectivity(
+                processor_id,
+                status="down",
+                event_type="disconnected",
+                detail=detail,
+            )
+            _mon_note_stream(processor_id, "area", subscribed=False)
+            _mon_note_stream(processor_id, "zone", subscribed=False)
+        except Exception:
+            pass
 
     while not shutdown_event.is_set():
         try:
             raw_msgs = await _recv_raw(reader)
+            if not raw_msgs:
+                _emit_processor_down("recv_empty")
+                break
             for raw in raw_msgs:
                 try:
                     msg = json.loads(raw)
@@ -1045,28 +1139,41 @@ async def unified_listener(reader, writer, db, processor_id):
                 url = header.get("Url", "")
 
                 if url == "/server/status/ping":
+                    if pending_ping_sent_at is not None:
+                        rtt_ms = int((time.monotonic() - pending_ping_sent_at) * 1000)
+                        if rtt_ms < 0:
+                            rtt_ms = 0
+                        pending_ping_sent_at = None
+                        ping_failure_emitted = False
+                        try:
+                            from app.monitoring.leap_telemetry import report_leap_ping
+
+                            status_code = header.get("StatusCode")
+                            success = True
+                            if isinstance(status_code, str) and status_code and not status_code.startswith("20"):
+                                success = False
+                            report_leap_ping(
+                                processor_id,
+                                success=success,
+                                rtt_ms=rtt_ms,
+                                detail={"status_code": status_code},
+                            )
+                        except Exception:
+                            pass
                     continue
                 elif "SubscribeResponse" in msg.get("CommuniqueType", ""):
                     continue
                 elif url == "/area/status" or (url.startswith("/area/") and url.endswith("/status")):
+                    _mon_note_stream(processor_id, "area", event=True)
                     if first_area_message:
                         first_area_message = False
                         continue
 
-                    # Log the complete raw message before any processing
-                    try:
-                        raw_msg_json = json.dumps(msg, indent=2, default=str)
-                        log_processor(processor_id, f"Complete Raw Area Status Message:")
-                        for line in raw_msg_json.split('\n'):
-                            if line.strip():  # Only log non-empty lines
-                                log_processor(processor_id, line)
-                    except Exception as e:
-                        log_processor(processor_id, f"Failed to log raw message: {e}", level=logging.ERROR)
-                    
                     check_area_occupancy(body, db, processor_id)
                     # Also log occupancy to occupancy_logs table
                     log_occupancy_to_table(body, db, processor_id)
                 elif url == "/zone/status" or (url.startswith("/zone/") and url.endswith("/status")):
+                    _mon_note_stream(processor_id, "zone", event=True)
                     if first_zone_message:
                         first_zone_message = False
                         continue
@@ -1092,6 +1199,7 @@ async def unified_listener(reader, writer, db, processor_id):
             break
         except Exception as e:
             listener_logger.error(f"[LISTEN ERROR] {e}")
+            _emit_processor_down("listen_error", error=str(e))
             await asyncio.sleep(1)
 
 
@@ -1168,8 +1276,58 @@ async def monitor_processor(processor):
                 server_hostname=get_proc_hostname(processor.system, processor.mac)
             )
             log_processor(processor.id, f"Successfully connected to processor {processor.id} ({processor.serial})")
+            try:
+                from app.monitoring.leap_connection_limits import (
+                    note_slot_acquired,
+                    report_connect_outcome,
+                )
+
+                report_connect_outcome(
+                    success=True,
+                    processor_id=processor.id,
+                    ipv4=processor.ipv4,
+                    source="listener",
+                )
+                note_slot_acquired(processor.id, source="listener")
+            except Exception:
+                pass
+            try:
+                from app.monitoring.leap_telemetry import report_connectivity
+
+                report_connectivity(
+                    processor.id,
+                    status="up",
+                    event_type="connected",
+                    detail={"ipv4": processor.ipv4, "serial": processor.serial},
+                )
+            except Exception:
+                pass
             await handle_connected_processor(processor, reader, writer, db)
             log_processor(processor.id, f"Connection to processor {processor.id} closed, will retry in 5 seconds")
+            try:
+                from app.monitoring.leap_connection_limits import note_slot_released
+
+                note_slot_released(processor.id, source="listener")
+            except Exception:
+                pass
+            try:
+                from app.monitoring.leap_telemetry import report_connectivity
+
+                report_connectivity(
+                    processor.id,
+                    status="down",
+                    event_type="disconnected",
+                    detail={"ipv4": processor.ipv4},
+                )
+                report_connectivity(
+                    processor.id,
+                    status="down",
+                    event_type="reconnecting",
+                    detail={"ipv4": processor.ipv4, "phase": "retry"},
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(5)
         except asyncio.CancelledError:
             log_processor(processor.id, f"Monitoring cancelled for processor {processor.id}")
             break
@@ -1177,6 +1335,35 @@ async def monitor_processor(processor):
             log_processor(processor.id, f"Connection failed for processor {processor.id} ({processor.serial}): {e}", level=logging.ERROR)
             db.add(ProcessorConnectionError(processor_id=processor.id, message="Connection failed"))
             db.commit()
+            try:
+                from app.monitoring.leap_connection_limits import report_connect_outcome
+
+                report_connect_outcome(
+                    success=False,
+                    processor_id=processor.id,
+                    ipv4=processor.ipv4,
+                    error=e,
+                    source="listener",
+                )
+            except Exception:
+                pass
+            try:
+                from app.monitoring.leap_telemetry import report_connectivity
+
+                report_connectivity(
+                    processor.id,
+                    status="down",
+                    event_type="connection_failed",
+                    detail={"ipv4": processor.ipv4, "error": str(e)},
+                )
+                report_connectivity(
+                    processor.id,
+                    status="down",
+                    event_type="reconnecting",
+                    detail={"ipv4": processor.ipv4, "phase": "retry"},
+                )
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
 
@@ -1217,7 +1404,30 @@ async def main_async():
 
 
 def listener_process_entrypoint():
+    mon_handle = None
+    leap_handle = None
     try:
+        try:
+            from app.monitoring.daemon_heartbeat import start_daemon_heartbeat
+            from app.monitoring.leap_telemetry import start_leap_telemetry
+
+            mon_handle = start_daemon_heartbeat("listener")
+            leap_handle = start_leap_telemetry()
+        except Exception as mon_err:
+            print(f"[Listener] Monitoring heartbeat start skipped: {mon_err}")
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
+    finally:
+        if leap_handle is not None:
+            try:
+                from app.monitoring.leap_telemetry import stop_leap_telemetry
+
+                stop_leap_telemetry()
+            except Exception:
+                pass
+        if mon_handle is not None:
+            try:
+                mon_handle.stop()
+            except Exception:
+                pass

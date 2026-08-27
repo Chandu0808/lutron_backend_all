@@ -265,20 +265,26 @@ def reconcile_all_processors_from_leap(db: Session) -> Dict[str, Any]:
 
 
 def clear_devices_not_in_inventory(
-    db: Session, processor_id: int, seen_device_codes: Set[Any]
+    db: Session,
+    processor_id: int,
+    seen_device_codes: Set[Any],
+    *,
+    processor_ids: Optional[List[int]] = None,
 ) -> int:
     """
-    After a full device discovery for one processor, clear not_ok devices that
-    were not present in this inventory (ghost Unavailable rows).
+    After a full device discovery, clear not_ok devices that were not present
+    in this inventory (ghost Unavailable rows). When processor_ids is set,
+    operate across the whole system (shared Athena device database).
     """
     if not seen_device_codes:
         return 0
     # Normalize to comparable strings
     seen = {str(c) for c in seen_device_codes if c is not None}
+    scope_ids = processor_ids if processor_ids else [processor_id]
     bad = (
         db.query(SensorAndModule)
         .filter(
-            SensorAndModule.processor_id == processor_id,
+            SensorAndModule.processor_id.in_(scope_ids),
             SensorAndModule.alert_status == "not_ok",
             SensorAndModule.solved_time.is_(None),
         )
@@ -295,18 +301,24 @@ def clear_devices_not_in_inventory(
     return cleared
 
 
-def dedupe_active_devices_by_serial(db: Session, processor_id: int) -> int:
+def dedupe_active_devices_by_serial(
+    db: Session,
+    processor_id: int,
+    *,
+    processor_ids: Optional[List[int]] = None,
+) -> int:
     """
-    Keep at most one active (not_ok, unsolved) device row per serial_number
-    on a processor. Prefer newest id.
+    Keep at most one active (not_ok, unsolved) device row per (device_code, serial)
+    across the processor scope. Serial alone is not unique (multi-output devices).
     """
     from collections import defaultdict
     from app.crud.alert import update_alert_timestamps
 
+    scope_ids = processor_ids if processor_ids else [processor_id]
     bad = (
         db.query(SensorAndModule)
         .filter(
-            SensorAndModule.processor_id == processor_id,
+            SensorAndModule.processor_id.in_(scope_ids),
             SensorAndModule.alert_status == "not_ok",
             SensorAndModule.solved_time.is_(None),
             SensorAndModule.serial_number.isnot(None),
@@ -315,11 +327,13 @@ def dedupe_active_devices_by_serial(db: Session, processor_id: int) -> int:
         .order_by(SensorAndModule.id.desc())
         .all()
     )
-    by_serial: Dict[str, List[SensorAndModule]] = defaultdict(list)
+    by_key: Dict[Tuple[str, str], List[SensorAndModule]] = defaultdict(list)
     for row in bad:
-        by_serial[str(row.serial_number).upper()].append(row)
+        code = str(row.device_code) if row.device_code is not None else ""
+        serial = str(row.serial_number).upper()
+        by_key[(code, serial)].append(row)
     cleared = 0
-    for rows in by_serial.values():
+    for rows in by_key.values():
         if len(rows) < 2:
             continue
         for extra in rows[1:]:

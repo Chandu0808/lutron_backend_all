@@ -77,11 +77,24 @@ def scene_status(
     logger.info(f"[API] POST /scene_status | area_id={input.area_id}, scene_id={input.scene_id}")
     try:
         result = get_scene_status(db, input.area_id, input.scene_id)
-        logger.info("[API] Scene status fetch successful")
+        if isinstance(result, dict) and result.get("status") == "error":
+            logger.warning(
+                "[API] /scene_status soft error: %s",
+                result.get("message"),
+            )
+        else:
+            logger.info("[API] Scene status fetch successful")
         return result
     except HTTPException as http_ex:
         logger.error(f"[API] HTTPException in /scene_status: {http_ex.detail}")
         raise http_ex
-    except Exception as e:
+    except Exception:
         logger.exception("[API] Unexpected error in /scene_status")
-        raise HTTPException(status_code=500, detail="Internal server error during scene status fetch")
+        # Last-resort: still avoid opaque 500 for Heat Map — return empty details.
+        return {
+            "status": "error",
+            "message": "Internal server error during scene status fetch",
+            "area_id": input.area_id,
+            "scene_id": input.scene_id,
+            "details": [],
+        }

@@ -28,6 +28,7 @@ from app.crud.alert_reconciliation import (
     active_processor_filter_clauses,
     reconcile_all_processors_from_leap,
 )
+from app.utils.alert_area_path import AreaPathResolver, sanitize_stored_path, area_alert_scope
 
 router = APIRouter()
 
@@ -185,6 +186,7 @@ def get_active_alerts(
         if current_user.role == "Operator":
             allowed_floor_ids = [perm.floor_id for perm in current_user.user_permissions]
         type_display_map = _get_alert_type_display_map(db)
+        path_resolver = AreaPathResolver(db)
 
         def include_type(alert_type: str) -> bool:
             if not types:
@@ -205,29 +207,34 @@ def get_active_alerts(
 
             for p in q_processors.all():
                 location = None
-                
-                # Check if processor has associated_area
+                area = None
+                associated_code = None
+
                 if p.associated_area:
-                    # Extract area code from href like "/area/1022"
-                    area_code = p.associated_area.split("/")[-1] if "/" in p.associated_area else p.associated_area
-                    
-                    # Try to find area in database with processor_id context
-                    area = db.query(Area).filter(Area.code == area_code, Area.processor_id == p.id).first()
-                    
-                    if area:
-                        # Build location from database
-                        location_parts = []
-                        if area.floor and area.floor.name:
-                            location_parts.append(area.floor.name)
-                        if area.name:
-                            location_parts.append(area.name)
-                        location = "/".join(location_parts) if location_parts else None
-                    else:
-                        # Area not found in DB, fetch from processor
-                        location = get_area_full_path_from_processor(p.ipv4, p.mac, p.system, area_code)
-                
+                    associated_code = (
+                        p.associated_area.split("/")[-1]
+                        if "/" in p.associated_area
+                        else p.associated_area
+                    )
+                    area = db.query(Area).filter(
+                        Area.code == associated_code, Area.processor_id == p.id
+                    ).first()
+                    scope = area_alert_scope(area, area_code=associated_code)
+                    location = path_resolver.resolve(
+                        area, None, area_code=scope["area_code"]
+                    )
+                    if not location:
+                        location = sanitize_stored_path(
+                            get_area_full_path_from_processor(
+                                p.ipv4, p.mac, p.system, associated_code
+                            )
+                        )
+                else:
+                    scope = area_alert_scope(None)
+
                 results.append({
                     "location": location,
+                    **scope,
                     "alert_type": "processor not responding",
                     "device_name": p.system,
                     "serial_no": p.serial,
@@ -241,43 +248,47 @@ def get_active_alerts(
 
         # Device Alerts
         if include_type("Device Not Responding") and type_display_map.get("Device Not Responding", True):
+            from app.utils.system_identity import (
+                heal_duplicate_active_device_alerts,
+                partition_active_device_alert_duplicates,
+                processor_system_key_map,
+            )
+
+            # Soft-heal Athena twins (Shade 3 / SL (5) on two processors) before listing.
+            try:
+                healed = heal_duplicate_active_device_alerts(db)
+                if healed:
+                    db.commit()
+            except Exception as heal_exc:
+                db.rollback()
+                print(f"[active_alerts] device duplicate heal skipped: {heal_exc}")
+
             bad_devices = db.query(SensorAndModule).filter(
                 *active_device_filter_clauses(),
             ).all()
-            for dev in bad_devices:
-                location = None
-                area = None
-                
-                # Try to get area from database if area_id exists
-                if dev.area_id:
-                    area = db.query(Area).filter(Area.id == dev.area_id).first()
-                
-                # Check operator permissions
+            survivors, _losers = partition_active_device_alert_duplicates(
+                bad_devices, processor_system_key_map(db)
+            )
+            for dev in survivors:
+                area = path_resolver.get_area(dev.area_id) if dev.area_id else None
+                if area is None and getattr(dev, "area_code", None):
+                    area = path_resolver.get_area_by_code(
+                        dev.area_code, getattr(dev, "processor_id", None)
+                    )
+
                 if area and current_user.role == "Operator" and area.floor_id not in allowed_floor_ids:
                     continue
-                
-                # If area found in DB, build location from database
-                if area:
-                    location_parts = []
-                    if area.floor and area.floor.name:
-                        location_parts.append(area.floor.name)
-                    if area.name:
-                        location_parts.append(area.name)
-                    location = "/".join(location_parts) if location_parts else None
-                
-                # If area not found in DB but we have area_code and processor_id, fetch from processor
-                elif dev.area_code and dev.processor_id:
-                    proc = db.query(Processor).filter(Processor.id == dev.processor_id).first()
-                    if proc:
-                        location = get_area_full_path_from_processor(
-                            proc.ipv4, 
-                            proc.mac, 
-                            proc.system, 
-                            str(dev.area_code)
-                        )
-                
+
+                scope = area_alert_scope(
+                    area, area_id=dev.area_id, area_code=dev.area_code
+                )
+                location = path_resolver.resolve(
+                    area, getattr(dev, "area_path", None), area_code=scope["area_code"]
+                )
+
                 results.append({
                     "location": location,
+                    **scope,
                     "alert_type": "Device Not Responding",
                     "device_name": dev.device_name,
                     "serial_no": dev.serial_number,
@@ -296,45 +307,34 @@ def get_active_alerts(
                 *active_driver_filter_clauses(),
             ).all()
             for d in drivers:
-                location = None
-                area = None
-                
-                # Try to get area from database if area_id exists
-                if d.area_id:
-                    area = db.query(Area).filter(Area.id == d.area_id).first()
-                
-                # Check operator permissions
+                area = path_resolver.get_area(d.area_id) if d.area_id else None
+                if area is None and getattr(d, "area_code", None):
+                    area = path_resolver.get_area_by_code(
+                        d.area_code, getattr(d, "processor_id", None)
+                    )
+
                 if area and current_user.role == "Operator" and area.floor_id not in allowed_floor_ids:
                     continue
-                
+
                 alert_type = driver_types.get(d.error_code, "Other Warnings")
                 if not type_display_map.get(alert_type, True):
                     continue
                 if not include_type(alert_type):
                     continue
-                
-                # If area found in DB, build location from database
-                if area:
-                    location_parts = []
-                    if area.floor and area.floor.name:
-                        location_parts.append(area.floor.name)
-                    if area.name:
-                        location_parts.append(area.name)
-                    location = "/".join(location_parts) if location_parts else None
-                
-                # If area not found in DB but we have area_code and processor_id, fetch from processor
-                elif d.area_code and d.processor_id:
-                    proc = db.query(Processor).filter(Processor.id == d.processor_id).first()
-                    if proc:
-                        location = get_area_full_path_from_processor(proc.ipv4, proc.mac, proc.system, str(d.area_code))
-                
-                # Try to get model number from SensorAndModule table using device_code
+
+                scope = area_alert_scope(
+                    area, area_id=d.area_id, area_code=d.area_code
+                )
+                location = path_resolver.resolve(
+                    area, getattr(d, "area_path", None), area_code=scope["area_code"]
+                )
+
                 model_number = None
                 serial_no = None
-               
-                
+
                 results.append({
                     "location": location,
+                    **scope,
                     "alert_type": alert_type,
                     "device_name": d.device_name,
                     "serial_no": serial_no,
@@ -357,7 +357,13 @@ def get_alert_types(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return all alert types currently active in the system."""
+    """
+    Return alert types enabled in Settings (display=true).
+
+    The Alerts page filter must list every type the operator opted to monitor,
+    not only types that currently have an active row — otherwise the dropdown
+    shrinks to whatever is failing right now (e.g. only Device Not Responding).
+    """
     try:
         require_operator_permission_for_scope(
             required_level=1,
@@ -373,67 +379,16 @@ def get_alert_types(
         raise
 
     try:
-        alert_types = set()
-        allowed_floor_ids = []
-        if current_user.role == "Operator":
-            allowed_floor_ids = [perm.floor_id for perm in current_user.user_permissions]
         type_display_map = _get_alert_type_display_map(db)
-
-        # Processor
-        q_proc = db.query(Processor).filter(
-            *active_processor_filter_clauses(),
-        )
-        if current_user.role == "Operator":
-            q_proc = q_proc.join(
-                FloorProcMapping, FloorProcMapping.processor_id == Processor.id
-            ).filter(FloorProcMapping.floor_id.in_(allowed_floor_ids))
-        if q_proc.first() and type_display_map.get("Processor Not Responding", True):
-            alert_types.add("Processor Not Responding")
-
-        # Devices
-        q_devices = db.query(SensorAndModule).filter(
-            *active_device_filter_clauses(),
-        ).all()
-        for dev in q_devices:
-            # Use area_id if available
-            area = None
-            if dev.area_id:
-                area = db.query(Area).filter(Area.id == dev.area_id).first()
-            
-            # Check operator permissions if area exists
-            if area and current_user.role == "Operator" and area.floor_id not in allowed_floor_ids:
-                continue
-            
-            # Include devices even if area_id is null (they have area_code or processor_id)
-            if type_display_map.get("Device Not Responding", True):
-                alert_types.add("Device Not Responding")
-            break
-
-        # Drivers
-        drivers = db.query(Driver).filter(
-            *active_driver_filter_clauses(),
-        ).all()
-        for d in drivers:
-            # Use area_id if available
-            area = None
-            if d.area_id:
-                area = db.query(Area).filter(Area.id == d.area_id).first()
-            
-            if not area:
-                continue
-            if current_user.role == "Operator" and area.floor_id not in allowed_floor_ids:
-                continue
-            if d.error_code == "E2":
-                if type_display_map.get("Ballast Failure", True):
-                    alert_types.add("Ballast Failure")
-            elif d.error_code == "FC":
-                if type_display_map.get("Lamp Failure", True):
-                    alert_types.add("Lamp Failure")
-            else:
-                if type_display_map.get("Other Warnings", True):
-                    alert_types.add("Other Warnings")
-
-        return {"status": "success", "alert_types": list(alert_types)}
+        ordered_types = [
+            "Processor Not Responding",
+            "Device Not Responding",
+            "Ballast Failure",
+            "Lamp Failure",
+            "Other Warnings",
+        ]
+        alert_types = [t for t in ordered_types if type_display_map.get(t, True)]
+        return {"status": "success", "alert_types": alert_types}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

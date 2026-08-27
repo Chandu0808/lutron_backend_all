@@ -35,21 +35,24 @@ router = APIRouter()
 @router.get("/full_area_status")
 def get_scene_zone_status_summary(
     area_id: int = Query(...),
+    live: int = Query(1, ge=0, le=1, description="1=LEAP assemble; 0=listener DB cache only"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
     """
     Area sidebar payload (scenes + zones + light/occ/energy).
 
-    Uses a single LEAP socket for live reads when the processor is reachable,
-    with per-section DB cache fallback so one failure does not blank the
-    heatmap sidebar. Response shape is unchanged for all UI variants.
+     live=1 (default): zone names/types from DB sync cache with live levels from LEAP;
+    area_scenes refreshed from LEAP /areascene when reachable (then cached); active
+    scene, light, and occupancy from LEAP when reachable (click / Apply).
+    live=0: listener DB cache only (timer/silent polls).
+    Response shape is unchanged for all UI variants.
     """
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:
         raise HTTPException(status_code=404, detail="Area not found in DB")
 
-    result = assemble_full_area_status(db, area_id)
+    result = assemble_full_area_status(db, area_id, live=bool(live))
     if result.get("status") != "success":
         raise HTTPException(status_code=404, detail=result.get("message") or "Area not found")
     return result

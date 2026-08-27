@@ -18,14 +18,54 @@ from app.utils.definitions import (
     LEAP_PRIVATE_KEY_FILE,
     get_processor_cert_paths,
 )
+from app.utils.alert_area_path import (
+    map_loadcontroller_from_db,
+    should_attempt_area_map,
+)
 
 CRLF = b"\r\n"
+
+
+def _mon_note_stream(processor_id, stream="loadcontroller", *, event=False, subscribed=None):
+    try:
+        from app.monitoring.stream_health import note_stream
+
+        note_stream(
+            int(processor_id),
+            stream,
+            event=event,
+            subscribed=subscribed,
+        )
+    except Exception:
+        pass
+
+
 shutdown_event = asyncio.Event()
 
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 0.5  # Base delay in seconds
 REQUEST_TIMEOUT = 5.0  # Timeout for API requests in seconds
+
+# Hard ceiling for one framed recv. Live status dumps are ~tens of KB;
+# uncapped growth to multi-GB was observed when the stream never completed CRLF.
+def _max_recv_bytes() -> int:
+    raw = (os.getenv("LOADCONTROLLER_MAX_RECV_BYTES") or "").strip()
+    if raw:
+        try:
+            return max(64 * 1024, int(raw))
+        except ValueError:
+            pass
+    return 8 * 1024 * 1024  # 8 MiB
+
+
+class LoadControllerStreamError(Exception):
+    """Fatal subscribe-stream condition — caller must drop the socket and reconnect."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason  # eof | oversized | recv_error
+        self.detail = detail or ""
+        super().__init__(f"{reason}: {self.detail}" if self.detail else reason)
 
 # ---------------------- Logger Setup ---------------------- #
 def setup_driver_alert_logger():
@@ -64,31 +104,51 @@ async def _send_json(writer: StreamWriter, json_msg: dict):
         raise
 
 async def _recv_raw(reader: StreamReader, timeout: float = REQUEST_TIMEOUT) -> list:
-    """Safely receive raw messages with timeout"""
+    """
+    Read CRLF-framed LEAP messages with a hard buffer cap.
+
+    Returns:
+      - list of decoded frames (may be empty on idle timeout — not an error)
+    Raises:
+      LoadControllerStreamError on EOF, oversized buffer, or socket failure so
+      the subscribe loop can reconnect instead of spinning / leaking RAM.
+    """
+    max_bytes = _max_recv_bytes()
     try:
         buffer = b""
         start_time = asyncio.get_event_loop().time()
-        
+
         while not buffer.endswith(CRLF):
-            # Check timeout
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed >= timeout:
                 break
-                
-            remaining_time = max(0.1, timeout - elapsed)  # Ensure at least 0.1s remaining
+
+            remaining_time = max(0.1, timeout - elapsed)
             try:
                 chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining_time)
             except TimeoutError:
                 break
-                
+
             if not chunk:
+                if not buffer:
+                    raise LoadControllerStreamError("eof")
                 break
             buffer += chunk
-            
+
+            if len(buffer) > max_bytes:
+                raise LoadControllerStreamError(
+                    "oversized",
+                    f"buffer={len(buffer)} max={max_bytes}",
+                )
+
+        if not buffer:
+            return []
         messages = buffer.split(CRLF)
         return [m.decode("utf-8", errors="replace").strip() for m in messages if m.strip()]
-    except Exception:
-        return []
+    except LoadControllerStreamError:
+        raise
+    except Exception as e:
+        raise LoadControllerStreamError("recv_error", str(e)) from e
 
 # ---------------------- Safe Parsing Helpers ---------------------- #
 def safe_get_href(obj, default="/0"):
@@ -559,6 +619,34 @@ def log_driver_alert_error(processor_id: int, loadcontroller_code: int, error_ty
 
 
 # ---------------------- Handle LoadController Status ---------------------- #
+def _apply_db_area_mapping(alert: Driver, db, processor_id: int, loadcontroller_code: int) -> None:
+    """
+    Map area from LMS DB only (zones.loadcontroller_code). Never use the subscribe socket.
+    Increments area_map_failures when mapping fails so dummy LCs are not retried forever.
+    """
+    if not should_attempt_area_map(
+        getattr(alert, "area_path", None), getattr(alert, "area_map_failures", 0)
+    ):
+        return
+
+    area_id, area_code, zone_code, area_path = map_loadcontroller_from_db(
+        db, processor_id, loadcontroller_code
+    )
+    if area_path:
+        alert.area_id = area_id or alert.area_id
+        if area_code is not None:
+            alert.area_code = area_code
+        if zone_code is not None:
+            alert.zone_code = zone_code
+            if not alert.zone_id:
+                alert.zone_id = _resolve_driver_zone_id(db, processor_id, zone_code)
+        alert.area_path = area_path
+        alert.area_map_failures = 0
+        return
+
+    alert.area_map_failures = int(getattr(alert, "area_map_failures", 0) or 0) + 1
+
+
 async def handle_loadcontroller_status(
     statuses, processor_id, writer, reader, *, full_snapshot: bool = False
 ):
@@ -606,13 +694,25 @@ async def handle_loadcontroller_status(
             if code == "Unknown" or desc == "Unknown":
                 continue
 
-            # Prefer newest row; collapse duplicate active rows for same LC+processor
-            alert = (
-                db.query(Driver)
-                .filter_by(loadcontroller_code=loadcontroller_code, processor_id=processor_id)
-                .order_by(Driver.id.desc())
-                .first()
-            )
+            # Prefer system-scoped row; collapse duplicate active rows for same LC
+            proc = db.query(Processor).filter(Processor.id == processor_id).first()
+            system_key = getattr(proc, "system_key", None) if proc else None
+            try:
+                from app.utils.system_identity import find_driver_for_upsert
+
+                alert = find_driver_for_upsert(
+                    db,
+                    loadcontroller_code=loadcontroller_code,
+                    processor_id=processor_id,
+                    system_key=system_key,
+                )
+            except Exception:
+                alert = (
+                    db.query(Driver)
+                    .filter_by(loadcontroller_code=loadcontroller_code, processor_id=processor_id)
+                    .order_by(Driver.id.desc())
+                    .first()
+                )
             if alert is not None:
                 try:
                     from app.crud.alert_reconciliation import dedupe_active_drivers_for_lc
@@ -621,6 +721,9 @@ async def handle_loadcontroller_status(
                     )
                 except Exception:
                     pass
+                if system_key and not getattr(alert, "system_key", None):
+                    alert.system_key = system_key
+                    alert.processor_id = processor_id
 
             if is_error_resolved:
                 # Error has been resolved - update existing alert to "okay" status
@@ -650,57 +753,19 @@ async def handle_loadcontroller_status(
                         alert.description = desc
                         # alert_status is already set by update_alert_timestamps
                         
-                        # Update missing data if needed
-                        needs_update = not alert.device_name or not alert.area_code or not alert.zone_code or not alert.device_code
+                        # Update missing data if needed (DB map only — never ReadRequest on subscribe socket)
+                        needs_update = (
+                            not getattr(alert, "area_path", None)
+                            or not alert.device_name
+                            or not alert.area_code
+                            or not alert.zone_code
+                            or not alert.device_code
+                        )
                         if needs_update:
-                            driver_alert_logger.warning(
-                                f"Updating existing alert with missing data. "
-                                f"Current missing: device_name={not alert.device_name}, "
-                                f"area_code={not alert.area_code}, zone_code={not alert.zone_code}, "
-                                f"device_code={not alert.device_code}",
-                                extra=log_context
-                            )
                             try:
-                                area_id, area_code, zone_code, device_code, device_type, device_name = \
-                                    await resolve_loadcontroller_mapping(
-                                        writer, reader, loadcontroller_code, db, processor_id
-                                    )
-                                
-                                if device_name and not alert.device_name:
-                                    alert.device_name = device_name
-                                if area_code and not alert.area_code:
-                                    alert.area_code = area_code
-                                if zone_code and not alert.zone_code:
-                                    alert.zone_code = zone_code
-                                if alert.zone_code and not alert.zone_id:
-                                    alert.zone_id = _resolve_driver_zone_id(
-                                        db, alert.processor_id, alert.zone_code
-                                    )
-                                if device_code and not alert.device_code:
-                                    alert.device_code = device_code
-                                if device_type and not alert.device_type:
-                                    alert.device_type = device_type
-                                if area_id and not alert.area_id:
-                                    alert.area_id = area_id
-                                
-                                # Log if still missing after update
-                                still_missing = []
-                                if not alert.area_id:
-                                    still_missing.append("area_id")
-                                if not alert.area_code:
-                                    still_missing.append("area_code")
-                                if not alert.zone_code:
-                                    still_missing.append("zone_code")
-                                if not alert.device_code:
-                                    still_missing.append("device_code")
-                                if not alert.device_name:
-                                    still_missing.append("device_name")
-                                
-                                if still_missing:
-                                    driver_alert_logger.error(
-                                        f"Alert still missing data after update attempt: {', '.join(still_missing)}",
-                                        extra=log_context
-                                    )
+                                _apply_db_area_mapping(
+                                    alert, db, processor_id, loadcontroller_code
+                                )
                             except Exception as e:
                                 driver_alert_logger.error(
                                     f"Failed to update missing data: {str(e)}",
@@ -714,47 +779,46 @@ async def handle_loadcontroller_status(
                 else:
                     # Create new alert - even with partial data
                     try:
-                        area_id, area_code, zone_code, device_code, device_type, device_name = \
-                            await resolve_loadcontroller_mapping(
-                                writer, reader, loadcontroller_code, db, processor_id
-                            )
-                        
-                        if area_id:
+                        new_alert = Driver(
+                            processor_id=processor_id,
+                            system_key=system_key,
+                            loadcontroller_code=loadcontroller_code,
+                            error_code=code,
+                            description=desc,
+                            alert_status="not_ok",
+                            area_map_failures=0,
+                        )
+                        current_time = datetime.utcnow()
+                        new_alert.reported_time = current_time
+                        new_alert.solved_time = None
+                        new_alert.created_at = current_time
 
-                            new_alert = Driver(
-                                processor_id=processor_id,
-                                area_id=area_id,
-                                area_code=area_code,
-                                zone_code=zone_code,
-                                zone_id=_resolve_driver_zone_id(db, processor_id, zone_code),
-                                device_code=device_code,
-                                device_type=device_type,
-                                device_name=device_name,
-                                loadcontroller_code=loadcontroller_code,
-                                error_code=code,
-                                description=desc,
-                                alert_status="not_ok"
-                            )
-                            
-                            # Set initial timestamps for new alert
-                            current_time = datetime.utcnow()
-                            new_alert.reported_time = current_time
-                            new_alert.solved_time = None
-                            new_alert.created_at = current_time
-                            
+                        _apply_db_area_mapping(
+                            new_alert, db, processor_id, loadcontroller_code
+                        )
+
+                        if new_alert.area_path or new_alert.area_id:
                             db.add(new_alert)
+                            db.flush()
+                            if system_key:
+                                try:
+                                    from app.utils.system_identity import collapse_duplicate_drivers
+
+                                    collapse_duplicate_drivers(db, system_key)
+                                except Exception:
+                                    pass
                             db.commit()
                         else: 
                             error_data = {
-                                "area_id": area_id,
-                                "area_code": area_code,
-                                "zone_code": zone_code,
-                                "device_code": device_code,
-                                "device_type": device_type,
-                                "device_name": device_name,
+                                "area_id": new_alert.area_id,
+                                "area_code": new_alert.area_code,
+                                "zone_code": new_alert.zone_code,
+                                "device_code": new_alert.device_code,
+                                "device_type": new_alert.device_type,
+                                "device_name": new_alert.device_name,
                                 "error_code": code,
                                 "description": desc,
-                                "reason": "Alert not created - area_id is missing"
+                                "reason": "Alert not created - area_id/area_path is missing"
                             }
                             # log_driver_alert_error(processor_id, loadcontroller_code, "missing_area_id", error_data)
 
@@ -864,47 +928,69 @@ async def loadcontroller_listener(reader, writer, processor_id):
                     extra={"processor_id": processor_id},
                 )
 
-    asyncio.create_task(send_ping())
-    asyncio.create_task(periodic_status_read())
-
-    while not shutdown_event.is_set():
-        try:
-            raw_msgs = await _recv_raw(reader)
-            for raw in raw_msgs:
+    ping_task = asyncio.create_task(send_ping())
+    periodic_task = asyncio.create_task(periodic_status_read())
+    try:
+        while not shutdown_event.is_set():
+            try:
                 try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-
-                ctype = msg.get("CommuniqueType")
-                header = msg.get("Header", {})
-                body = msg.get("Body", {})
-                url = header.get("Url", "")
-
-                if url == "/server/status/ping":
-                    continue
-                elif ctype == "SubscribeResponse" and "LoadControllerStatuses" in body:
-                    await handle_loadcontroller_status(
-                        body["LoadControllerStatuses"],
-                        processor_id,
-                        writer,
-                        reader,
-                        full_snapshot=True,
+                    raw_msgs = await _recv_raw(reader)
+                except LoadControllerStreamError as stream_err:
+                    driver_alert_logger.warning(
+                        f"LoadController stream {stream_err.reason} "
+                        f"(processor_id={processor_id}): {stream_err.detail or stream_err.reason} "
+                        "— reconnecting"
                     )
-                elif url == "/loadcontroller/status":
-                    # Full inventory on Read/Subscribe; partial deltas must not orphan-clear
-                    is_full = ctype in ("ReadResponse", "SubscribeResponse")
-                    await handle_loadcontroller_status(
-                        body.get("LoadControllerStatuses", []),
-                        processor_id,
-                        writer,
-                        reader,
-                        full_snapshot=is_full,
-                    )
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            await asyncio.sleep(1)
+                    _mon_note_stream(processor_id, subscribed=False)
+                    break
+                # Idle timeout → empty list is normal; keep subscribed.
+                for raw in raw_msgs:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    ctype = msg.get("CommuniqueType")
+                    header = msg.get("Header", {})
+                    body = msg.get("Body", {})
+                    url = header.get("Url", "")
+
+                    if url == "/server/status/ping":
+                        continue
+                    elif ctype == "SubscribeResponse" and "LoadControllerStatuses" in body:
+                        _mon_note_stream(processor_id, event=True)
+                        await handle_loadcontroller_status(
+                            body["LoadControllerStatuses"],
+                            processor_id,
+                            writer,
+                            reader,
+                            full_snapshot=True,
+                        )
+                    elif url == "/loadcontroller/status":
+                        # Full inventory on Read/Subscribe; partial deltas must not orphan-clear
+                        is_full = ctype in ("ReadResponse", "SubscribeResponse")
+                        _mon_note_stream(processor_id, event=True)
+                        await handle_loadcontroller_status(
+                            body.get("LoadControllerStatuses", []),
+                            processor_id,
+                            writer,
+                            reader,
+                            full_snapshot=is_full,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                _mon_note_stream(processor_id, subscribed=False)
+                await asyncio.sleep(1)
+                break
+    finally:
+        ping_task.cancel()
+        periodic_task.cancel()
+        for task in (ping_task, periodic_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 # ---------------------- Processor Handling ---------------------- #
 async def handle_connected_processor(processor, reader, writer):
@@ -912,6 +998,7 @@ async def handle_connected_processor(processor, reader, writer):
         "CommuniqueType": "SubscribeRequest",
         "Header": {"Url": "/loadcontroller/status"}
     })
+    _mon_note_stream(processor.id, subscribed=True)
     await loadcontroller_listener(reader, writer, processor.id)
 
 async def monitor_loadcontroller(processor):
@@ -932,10 +1019,52 @@ async def monitor_loadcontroller(processor):
                 ssl=ctx,
                 server_hostname=get_proc_hostname(processor.system, processor.mac)
             )
-            await handle_connected_processor(processor, reader, writer)
+            try:
+                from app.monitoring.leap_connection_limits import (
+                    note_slot_acquired,
+                    report_connect_outcome,
+                )
+
+                report_connect_outcome(
+                    success=True,
+                    processor_id=processor.id,
+                    ipv4=processor.ipv4,
+                    source="loadcontroller_listener",
+                )
+                note_slot_acquired(processor.id, source="loadcontroller_listener")
+            except Exception:
+                pass
+            try:
+                await handle_connected_processor(processor, reader, writer)
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                try:
+                    from app.monitoring.leap_connection_limits import note_slot_released
+
+                    note_slot_released(processor.id, source="loadcontroller_listener")
+                except Exception:
+                    pass
+            # Subscribe ended (EOF / oversized / idle break) — brief pause then resubscribe.
+            await asyncio.sleep(1)
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
+            try:
+                from app.monitoring.leap_connection_limits import report_connect_outcome
+
+                report_connect_outcome(
+                    success=False,
+                    processor_id=processor.id,
+                    ipv4=processor.ipv4,
+                    error=e,
+                    source="loadcontroller_listener",
+                )
+            except Exception:
+                pass
             db = SessionLocal()
             try:
                 db.add(ProcessorConnectionError(processor_id=processor.id, message="LoadController connection failed"))
@@ -972,7 +1101,20 @@ async def main_async():
         db.close()
 
 def loadcontroller_listener_entrypoint():
+    mon_handle = None
     try:
+        try:
+            from app.monitoring.daemon_heartbeat import start_daemon_heartbeat
+
+            mon_handle = start_daemon_heartbeat("loadcontroller_listener")
+        except Exception as mon_err:
+            print(f"[LoadController] Monitoring heartbeat start skipped: {mon_err}")
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
+    finally:
+        if mon_handle is not None:
+            try:
+                mon_handle.stop()
+            except Exception:
+                pass

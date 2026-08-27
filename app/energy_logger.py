@@ -872,6 +872,30 @@ def check_and_fill_missing_data_simple(db: Session, current_time: datetime, look
 
 # --------------------- ENERGY + OCCUPANCY + ZONE LOGGING JOB --------------------- #
 async def log_energy_stats():
+    _jobs_on = False
+    _job_started_at = None
+    _job_t0 = time.perf_counter()
+    _job_outcome = "success"
+    _job_error_class = None
+    _job_error_message = None
+    try:
+        from app.monitoring.job_wrapper import (
+            emit_job_started,
+            is_job_instrumentation_active,
+        )
+
+        _jobs_on = is_job_instrumentation_active()
+        _job_started_at = datetime.now(timezone.utc)
+        if _jobs_on:
+            emit_job_started(
+                "log_energy_stats",
+                started_at=_job_started_at,
+                trigger_source="apscheduler",
+                component_code="energy_logger",
+            )
+    except Exception:
+        _jobs_on = False
+
     db: Session = SessionLocal()
     context = get_context_info()
     cycle_start_time = time.time()
@@ -1341,6 +1365,9 @@ async def log_energy_stats():
             raise
 
     except Exception as e:
+        _job_outcome = "failure"
+        _job_error_class = type(e).__name__
+        _job_error_message = str(e)
         cycle_duration = (time.time() - cycle_start_time) * 1000
         energy_logger.error(
             f"[LOG_ENERGY_STATS] ========== FATAL ERROR ========== | "
@@ -1359,6 +1386,22 @@ async def log_energy_stats():
             f"[LOG_ENERGY_STATS] Database session closed | "
             f"Context: PID={context['pid']}, TID={context['tid']}"
         )
+        if _jobs_on and _job_started_at is not None:
+            try:
+                from app.monitoring.job_wrapper import emit_job_finished
+
+                emit_job_finished(
+                    "log_energy_stats",
+                    _job_outcome,
+                    started_at=_job_started_at,
+                    duration_ms=max(0, int((time.perf_counter() - _job_t0) * 1000)),
+                    error_class=_job_error_class,
+                    error_message=_job_error_message,
+                    trigger_source="apscheduler",
+                    component_code="energy_logger",
+                )
+            except Exception:
+                pass
 
 
 # --------------------- SCHEDULER SETUP --------------------- #
@@ -1722,12 +1765,28 @@ def energy_logger_process_entrypoint():
     # Register cleanup function to release lock on normal exit
     # This will be called even if the process is terminated normally
     atexit.register(release_process_lock)
-    
+
+    mon_handle = None
     try:
-        _manual = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower() in ("true", "1", "yes")
+        try:
+            from app.monitoring.daemon_heartbeat import start_daemon_heartbeat
+
+            mon_handle = start_daemon_heartbeat("energy_logger")
+        except Exception as mon_err:
+            energy_logger.warning(
+                f"[PROCESS_ENTRYPOINT] Monitoring heartbeat start skipped | Error: {mon_err}"
+            )
+
+        try:
+            from app.installation_config import is_energy_logger_manual
+
+            _manual = is_energy_logger_manual()
+        except Exception:
+            _manual = (os.getenv("energy_logger_manual") or os.getenv("energy_logger_mannual") or "").strip().lower() in ("true", "1", "yes")
         energy_logger.info(
             f"[PROCESS_ENTRYPOINT] Energy logger process started | "
             f"PID: {current_pid} | LockFile: {LOCK_FILE_PATH} | "
+            f"energy_logger_manual={_manual} | "
             f"Context: PID={context['pid']}, TID={context['tid']}"
         )
         print(f"[Energy Logger] Process started successfully (PID: {current_pid})")
@@ -1755,8 +1814,11 @@ def energy_logger_process_entrypoint():
         traceback.print_exc()
     
     finally:
-        # Ensure lock is released even if atexit doesn't run (shouldn't happen, but be safe)
-        # Note: atexit should handle this, but we do it here too for extra safety
+        if mon_handle is not None:
+            try:
+                mon_handle.stop()
+            except Exception:
+                pass
         try:
             release_process_lock()
         except Exception as cleanup_error:

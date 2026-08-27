@@ -265,7 +265,14 @@ def create_floor(db: Session, name: str, image_path: str):
     db.refresh(floor)
     return floor
 
-def get_area_light_status_by_floor(db: Session, floor_id: int):
+def get_area_light_status_by_floor(db: Session, floor_id: int, live: bool = True):
+    """
+    Floor light map payload.
+
+    live=True (default): LEAP /area/status per processor, then listener cache fill-in.
+    live=False: listener DB cache only (current_zone_status) — no LEAP SSL.
+    Response shape is identical for both modes.
+    """
     floor = db.query(Floor).filter(Floor.id == floor_id).first()
     if not floor:
         return {"status": "error", "message": "Floor not found"}
@@ -296,47 +303,48 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
         for area in areas
     }
 
-    for processor_id, processor_areas in processor_area_map.items():
-        processor = db.query(Processor).filter(Processor.id == processor_id).first()
-        if not processor:
-            # Processor not found — show PDF original colors on Heat Map
-            _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
-            continue
+    if live:
+        for processor_id, processor_areas in processor_area_map.items():
+            processor = db.query(Processor).filter(Processor.id == processor_id).first()
+            if not processor:
+                # Processor not found — show PDF original colors on Heat Map
+                _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
+                continue
 
-        if not is_processor_reachable(processor.ipv4):
-            print(f"Processor not reachable: {processor.ipv4}")
-            _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
-            continue
+            if not is_processor_reachable(processor.ipv4):
+                print(f"Processor not reachable: {processor.ipv4}")
+                _mark_areas_processor_unreachable(results_dict, processor_areas, light=True)
+                continue
 
-        try:
-            with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as ssock:
-                send_json(ssock, {
-                    "CommuniqueType": "ReadRequest",
-                    "Header": {"Url": "/area/status"}
-                })
-                response = recv_json(ssock)
-                if not isinstance(response, dict):
-                    print(f"Empty LEAP /area/status from {processor.ipv4}; will use cache")
-                    continue
-                status_map = {
-                    item["href"]: item
-                    for item in response.get("Body", {}).get("AreaStatuses", [])
-                }
+            try:
+                with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as ssock:
+                    send_json(ssock, {
+                        "CommuniqueType": "ReadRequest",
+                        "Header": {"Url": "/area/status"}
+                    })
+                    response = recv_json(ssock)
+                    if not isinstance(response, dict):
+                        print(f"Empty LEAP /area/status from {processor.ipv4}; will use cache")
+                        continue
+                    status_map = {
+                        item["href"]: item
+                        for item in response.get("Body", {}).get("AreaStatuses", [])
+                    }
 
-                for area in processor_areas:
-                    area_href = f"/area/{area.code}/status"
-                    level = status_map.get(area_href, {}).get("Level")
-                    zone_status, light_level = _level_to_light_fields(level)
+                    for area in processor_areas:
+                        area_href = f"/area/{area.code}/status"
+                        level = status_map.get(area_href, {}).get("Level")
+                        zone_status, light_level = _level_to_light_fields(level)
 
-                    # Update the area status in results_dict
-                    results_dict[area.id]["light_status"] = zone_status
-                    results_dict[area.id]["light_level"] = light_level
+                        # Update the area status in results_dict
+                        results_dict[area.id]["light_status"] = zone_status
+                        results_dict[area.id]["light_level"] = light_level
 
-        except Exception as e:
-            print(f"Processor {processor.ipv4} error: {e}")
-            # Areas remain with null status - no need to update
+            except Exception as e:
+                print(f"Processor {processor.ipv4} error: {e}")
+                # Areas remain with null status - no need to update
 
-    # Listener cache when live LEAP failed / empty response (not for ping-unreachable areas)
+    # Listener cache: fill gaps after LEAP, or sole source when live=False
     _apply_cached_zone_levels(db, results_dict)
 
     # Convert dict values to list
@@ -414,7 +422,14 @@ def get_area_light_status_by_floor(db: Session, floor_id: int):
 
 
 
-def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
+def get_area_occupancy_status_by_floor(db: Session, floor_id: int, live: bool = True):
+    """
+    Floor occupancy map payload.
+
+    live=True (default): LEAP /area/status per processor, then listener cache fill-in.
+    live=False: listener DB cache only (current_area_status) — no LEAP SSL.
+    Response shape is identical for both modes.
+    """
     floor = db.query(Floor).filter(Floor.id == floor_id).first()
     if not floor:
         return {"status": "error", "message": "Floor not found"}
@@ -443,48 +458,49 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
         for area in areas
     }
 
-    for processor_id, processor_areas in processor_area_map.items():
-        processor = db.query(Processor).filter(Processor.id == processor_id).first()
-        if not processor:
-            _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
-            continue
+    if live:
+        for processor_id, processor_areas in processor_area_map.items():
+            processor = db.query(Processor).filter(Processor.id == processor_id).first()
+            if not processor:
+                _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
+                continue
 
-        if not is_processor_reachable(processor.ipv4):
-            print(f"Processor not reachable: {processor.ipv4}")
-            _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
-            continue
+            if not is_processor_reachable(processor.ipv4):
+                print(f"Processor not reachable: {processor.ipv4}")
+                _mark_areas_processor_unreachable(results_dict, processor_areas, light=False)
+                continue
 
-        try:
-            with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as ssock:
-                send_json(ssock, {
-                    "CommuniqueType": "ReadRequest",
-                    "Header": {"Url": "/area/status"}
-                })
-                response = recv_json(ssock)
-                if not isinstance(response, dict):
-                    print(f"Empty LEAP /area/status (occupancy) from {processor.ipv4}; will use cache")
-                    continue
-                status_map = {
-                    item["href"]: item
-                    for item in response.get("Body", {}).get("AreaStatuses", [])
-                }
+            try:
+                with create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4) as ssock:
+                    send_json(ssock, {
+                        "CommuniqueType": "ReadRequest",
+                        "Header": {"Url": "/area/status"}
+                    })
+                    response = recv_json(ssock)
+                    if not isinstance(response, dict):
+                        print(f"Empty LEAP /area/status (occupancy) from {processor.ipv4}; will use cache")
+                        continue
+                    status_map = {
+                        item["href"]: item
+                        for item in response.get("Body", {}).get("AreaStatuses", [])
+                    }
 
-                for area in processor_areas:
-                    area_href = f"/area/{area.code}/status"
-                    occupancy = status_map.get(area_href, {}).get("OccupancyStatus")
-                    
-                    # If OccupancyStatus is None or "Unknown", set to None
-                    if occupancy is None or occupancy == "Unknown":
-                        occupancy = None
+                    for area in processor_areas:
+                        area_href = f"/area/{area.code}/status"
+                        occupancy = status_map.get(area_href, {}).get("OccupancyStatus")
 
-                    # Update the area status in results_dict
-                    results_dict[area.id]["occupancy_status"] = occupancy
+                        # If OccupancyStatus is None or "Unknown", set to None
+                        if occupancy is None or occupancy == "Unknown":
+                            occupancy = None
 
-        except Exception as e:
-            print(f"Error retrieving occupancy from processor {processor.ipv4}: {e}")
-            # Areas remain with null status - no need to update
+                        # Update the area status in results_dict
+                        results_dict[area.id]["occupancy_status"] = occupancy
 
-    # Listener cache when live LEAP failed / empty response (not for ping-unreachable areas)
+            except Exception as e:
+                print(f"Error retrieving occupancy from processor {processor.ipv4}: {e}")
+                # Areas remain with null status - no need to update
+
+    # Listener cache: fill gaps after LEAP, or sole source when live=False
     _apply_cached_occupancy(db, results_dict)
 
     # Convert dict values to list
@@ -505,40 +521,6 @@ def get_area_occupancy_status_by_floor(db: Session, floor_id: int):
         "y_bottom": floor.y_bottom,
         "areas": results
     }
-
-def get_floor_status_revision(db: Session, floor_id: int):
-    """
-    Cheap DB fingerprint for heatmap area-click: max updated_at of area + zone
-    status rows on this floor. No LEAP.
-    """
-    floor = db.query(Floor).filter(Floor.id == floor_id).first()
-    if not floor:
-        return {"status": "error", "message": "Floor not found"}
-
-    area_ids = [
-        row[0] for row in db.query(Area.id).filter(Area.floor_id == floor_id).all()
-    ]
-    if not area_ids:
-        return {"status": "success", "floor_id": floor_id, "revision": None}
-
-    area_max = (
-        db.query(func.max(CurrentAreaEvent.updated_at))
-        .filter(CurrentAreaEvent.area_id.in_(area_ids))
-        .scalar()
-    )
-    zone_max = (
-        db.query(func.max(CurrentZoneEvent.updated_at))
-        .filter(CurrentZoneEvent.area_id.in_(area_ids))
-        .scalar()
-    )
-    times = [t for t in (area_max, zone_max) if t is not None]
-    revision = max(times) if times else None
-    return {
-        "status": "success",
-        "floor_id": floor_id,
-        "revision": revision.isoformat() if revision is not None else None,
-    }
-
 
 def get_area_energy_status_by_floor(db: Session, floor_id: int):
     # Step 1: Validate floor existence

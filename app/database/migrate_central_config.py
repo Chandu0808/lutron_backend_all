@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import List
+
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 
@@ -25,9 +27,21 @@ def _table_exists(engine: Engine, table_name: str) -> bool:
 
 
 def ensure_central_config_tables(engine: Engine) -> None:
-    """Create installation_settings, widget_configuration, dashboard_layout if missing."""
+    """Create central config tables if missing, then seed installation defaults."""
     for model in _CENTRAL_CONFIG_MODELS:
         model.__table__.create(engine, checkfirst=True)
+    inserted = seed_installation_settings_on_create()
+    if inserted:
+        print(
+            "[DB] installation_settings defaults seeded: "
+            + ", ".join(inserted)
+        )
+
+
+def seed_installation_settings_on_create() -> List[str]:
+    from app.crud.installation_settings import seed_installation_runtime_defaults
+
+    return seed_installation_runtime_defaults()
 
 
 def central_config_tables_present(engine: Engine) -> bool:

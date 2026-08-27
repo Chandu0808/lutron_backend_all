@@ -11,6 +11,7 @@ from app.models.processor import Processor
 from app.models.drivers import Driver
 from app.utils.json_connection import connect_to_processor, send_json, recv_json
 from app.database.session import SessionLocal
+from app.utils.alert_area_path import AreaPathResolver, build_area_path, map_area_from_codes
 
 
 # ------------------- Device Refresh Logger Setup ------------------- #
@@ -200,6 +201,21 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
         if not sock:
             raise Exception("Could not connect to processor")
 
+        # Same socket: derive system_key from /project (no extra LEAP connection)
+        system_key = getattr(processor, "system_key", None)
+        try:
+            from app.utils.system_identity import apply_project_identity
+
+            send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": "/project"}})
+            project_resp = recv_json(sock)
+            system_key = apply_project_identity(
+                processor, project_resp, fallback_serial=processor.serial
+            )
+            db.flush()
+        except Exception as project_exc:
+            print(f"[Device Discovery] /project identity failed for processor {processor_id}: {project_exc}")
+            system_key = getattr(processor, "system_key", None)
+
         send_json(sock, {"CommuniqueType": "ReadRequest", "Header": {"Url": "/device/status/availability"}})
         resp = recv_json(sock)
         statuses = resp.get("Body", {}).get("DeviceAvailabilityStatuses", []) if resp else []
@@ -207,6 +223,13 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
         # Log raw API response before processing
         # log_raw_device_availability_data(processor_id, ip, resp, statuses)
 
+        from app.utils.system_identity import (
+            collapse_duplicate_devices,
+            find_device_for_upsert,
+            system_processor_ids,
+        )
+
+        path_resolver = AreaPathResolver(db)
         results = []
         raw_device_data = []  # Collect raw device data for logging
         seen_device_codes = set()
@@ -249,6 +272,7 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                 addressed_state = dev_info.get("AddressedState", "")
                 area_code = None
                 area_id = None
+                area = None
 
                 # Resolve associated area with processor context
                 area_field = dev_info.get("AssociatedArea") or dev_info.get("Area")
@@ -258,6 +282,13 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                     if area:
                         area_id = area.id
 
+                area_path = build_area_path(area, resolver=path_resolver) if area else None
+                if not area_path and area_code:
+                    aid, area_path = map_area_from_codes(
+                        db, processor_id, area_code, resolver=path_resolver
+                    )
+                    if aid and not area_id:
+                        area_id = aid
                 # Filter phantom and PN2 devices
                 if "phantom" in device_type.lower() or (device_model and device_model.upper().startswith("PN2")):
                     continue
@@ -270,16 +301,24 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                 else:
                     alert_status = "unknown"
 
-                existing = db.query(SensorAndModule).filter(
-                    SensorAndModule.device_code == device_code,
-                    SensorAndModule.processor_id == processor_id
-                ).first()
+                existing = find_device_for_upsert(
+                    db,
+                    device_code=device_code,
+                    processor_id=processor_id,
+                    system_key=system_key,
+                )
                 if existing:
                     # Update alert timestamps based on status change
                     update_alert_timestamps(existing, alert_status)
-                    
+
+                    existing.processor_id = processor_id
+                    if system_key:
+                        existing.system_key = system_key
                     existing.area_id = area_id
                     existing.area_code = area_code
+                    if area_path:
+                        existing.area_path = area_path
+                        existing.area_map_failures = 0
                     existing.device_name = device_name
                     existing.serial_number = serial_number
                     existing.device_model = device_model
@@ -291,6 +330,7 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                     # New device - set initial timestamps
                     new_device = SensorAndModule(
                         processor_id=processor_id,
+                        system_key=system_key,
                         device_code=device_code,
                         device_name=device_name,
                         serial_number=serial_number,
@@ -300,6 +340,8 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                         alert_status=alert_status,
                         area_code=area_code,
                         area_id=area_id,
+                        area_path=area_path,
+                        area_map_failures=0 if area_path else 1,
                         device_kind="sensor_or_module"
                     )
                     
@@ -335,14 +377,26 @@ def discover_and_upsert_all_devices(db: Session, ip: str, mac: str, system: str)
                 continue
 
         # Clear ghost Unavailable rows not present in this full inventory,
-        # then collapse duplicate active rows for the same serial.
+        # then collapse system-scoped duplicates and serial-dedupe actives.
         try:
             from app.crud.alert_reconciliation import (
                 clear_devices_not_in_inventory,
                 dedupe_active_devices_by_serial,
             )
-            clear_devices_not_in_inventory(db, processor_id, seen_device_codes)
-            dedupe_active_devices_by_serial(db, processor_id)
+            from app.utils.system_identity import backfill_row_system_keys_from_processors
+
+            proc_ids = system_processor_ids(db, processor)
+            clear_devices_not_in_inventory(db, processor_id, seen_device_codes, processor_ids=proc_ids)
+            backfill_row_system_keys_from_processors(db)
+            if system_key:
+                collapse_duplicate_devices(db, system_key)
+            dedupe_active_devices_by_serial(db, processor_id, processor_ids=proc_ids)
+            try:
+                from app.utils.system_identity import heal_duplicate_active_device_alerts
+
+                heal_duplicate_active_device_alerts(db)
+            except Exception:
+                pass
         except Exception as orphan_exc:
             print(f"[Device Discovery] Orphan/dedupe cleanup failed for processor {processor_id}: {orphan_exc}")
 

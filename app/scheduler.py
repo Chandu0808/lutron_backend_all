@@ -128,15 +128,60 @@ def load_all_schedules():
 # ------------------- Device Refresh Task ------------------- #
 def schedule_device_refresh():
     try:
+        job_fn = alert.refresh_all_devices
+        try:
+            from app.monitoring.job_wrapper import wrap_callable
+
+            job_fn = wrap_callable(
+                "device_refresh",
+                alert.refresh_all_devices,
+                trigger_source="apscheduler",
+                component_code="scheduler",
+                result_failure=lambda r: isinstance(r, dict) and r.get("status") == "error",
+            )
+        except Exception:
+            job_fn = alert.refresh_all_devices
+
         scheduler.add_job(
-            alert.refresh_all_devices,          # unified refresh for sensors + modules
-            CronTrigger(minute="*/15"),         # every 15 minutes
+            job_fn,
+            CronTrigger(minute="*/15"),
             id="device_refresh",
             replace_existing=True
         )
         print("[Scheduler] Device refresh scheduled every 15 min")
     except Exception as e:
         print(f"[Scheduler Error] Could not schedule device refresh: {e}")
+
+
+def schedule_alert_reconcile():
+    """Clear stale alerts + retry area_path mapping every 30 minutes."""
+    try:
+        from app.crud.alert_reconcile import reconcile_alerts
+
+        job_fn = reconcile_alerts
+        try:
+            from app.monitoring.job_wrapper import wrap_callable
+
+            job_fn = wrap_callable(
+                "alert_reconcile",
+                reconcile_alerts,
+                trigger_source="apscheduler",
+                component_code="scheduler",
+                result_failure=lambda r: isinstance(r, dict) and r.get("status") == "error",
+            )
+        except Exception:
+            job_fn = reconcile_alerts
+
+        scheduler.add_job(
+            job_fn,
+            CronTrigger(minute="*/30"),
+            id="alert_reconcile",
+            replace_existing=True,
+            max_instances=1,
+        )
+        print("[Scheduler] Alert reconcile scheduled every 30 min")
+    except Exception as e:
+        print(f"[Scheduler Error] Could not schedule alert reconcile: {e}")
 
 
 def _run_driver_alert_live_reconcile():
@@ -157,8 +202,21 @@ def _run_driver_alert_live_reconcile():
 
 def schedule_driver_alert_live_reconcile():
     try:
+        job_fn = _run_driver_alert_live_reconcile
+        try:
+            from app.monitoring.job_wrapper import wrap_callable
+
+            job_fn = wrap_callable(
+                "driver_alert_live_reconcile",
+                _run_driver_alert_live_reconcile,
+                trigger_source="apscheduler",
+                component_code="scheduler",
+            )
+        except Exception:
+            job_fn = _run_driver_alert_live_reconcile
+
         scheduler.add_job(
-            _run_driver_alert_live_reconcile,
+            job_fn,
             CronTrigger(minute="*/15"),
             id="driver_alert_live_reconcile",
             replace_existing=True,
@@ -182,40 +240,59 @@ def daily_data_backfill():
         This ensures the 00:00 logging job runs on time even if backfill takes longer.
         """
         from app.energy_logger import check_and_fill_missing_data_simple
-        
-        db = SessionLocal()
-        backfill_start_time = datetime.now()
-        
+
         try:
-            print(f"[Daily Backfill] Starting at {backfill_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print("[Daily Backfill] Checking all day's data (last 24 hours)")
-            
-            # Use the existing function with 24 hours lookback to check entire day
-            energy_filled, occupancy_filled = check_and_fill_missing_data_simple(
-                db, 
-                backfill_start_time, 
-                lookback_hours=24
-            )
-            
-            # Commit the changes
-            db.commit()
-            
-            backfill_end_time = datetime.now()
-            duration = (backfill_end_time - backfill_start_time).total_seconds()
-            
-            print(
-                f"[Daily Backfill] Completed at {backfill_end_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"(took {duration:.2f}s) - "
-                f"Energy filled: {energy_filled} | Occupancy filled: {occupancy_filled}"
-            )
-            
-        except Exception as e:
-            print(f"[Daily Backfill Error] Fatal error: {e}")
-            import traceback
-            traceback.print_exc()
-            db.rollback()
-        finally:
-            db.close()
+            from app.monitoring.job_wrapper import job_execution
+        except Exception:
+            job_execution = None  # type: ignore
+
+        def _run(status=None):
+            db = SessionLocal()
+            backfill_start_time = datetime.now()
+            try:
+                print(f"[Daily Backfill] Starting at {backfill_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("[Daily Backfill] Checking all day's data (last 24 hours)")
+
+                energy_filled, occupancy_filled = check_and_fill_missing_data_simple(
+                    db,
+                    backfill_start_time,
+                    lookback_hours=24
+                )
+
+                db.commit()
+
+                backfill_end_time = datetime.now()
+                duration = (backfill_end_time - backfill_start_time).total_seconds()
+
+                print(
+                    f"[Daily Backfill] Completed at {backfill_end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(took {duration:.2f}s) - "
+                    f"Energy filled: {energy_filled} | Occupancy filled: {occupancy_filled}"
+                )
+            except Exception as e:
+                print(f"[Daily Backfill Error] Fatal error: {e}")
+                import traceback
+                traceback.print_exc()
+                db.rollback()
+                if status is not None:
+                    status["outcome"] = "failure"
+                    status["error_class"] = type(e).__name__
+                    status["error_message"] = str(e)
+            finally:
+                db.close()
+
+        if job_execution is None:
+            _run()
+            return
+        try:
+            with job_execution(
+                "daily_data_backfill",
+                trigger_source="apscheduler",
+                component_code="scheduler",
+            ) as status:
+                _run(status)
+        except Exception:
+            pass
     
     # Start backfill in daemon thread (won't block scheduler shutdown)
     backfill_thread = threading.Thread(target=run_backfill_in_thread, daemon=True)
@@ -254,46 +331,70 @@ def occupancy_logs_reconciliation():
         Execute reconciliation in separate thread to ensure it doesn't block scheduler.
         """
         from app.crud.occupancy_logs import reconcile_occupancy_logs
-        
-        # Acquire lock to prevent concurrent execution
+
+        try:
+            from app.monitoring.job_wrapper import job_execution, report_job_skipped
+        except Exception:
+            job_execution = None  # type: ignore
+            report_job_skipped = None  # type: ignore
+
         if not reconciliation_lock.acquire(blocking=False):
             print("[Occupancy Reconciliation] Skipped - reconciliation already in progress")
+            if report_job_skipped is not None:
+                try:
+                    report_job_skipped(
+                        "occupancy_reconciliation",
+                        outcome="skipped_lock",
+                        trigger_source="apscheduler",
+                        component_code="scheduler",
+                    )
+                except Exception:
+                    pass
             return
-        
-        db = SessionLocal()
-        reconciliation_start_time = datetime.now()
-        
+
+        def _run(status=None):
+            db = SessionLocal()
+            reconciliation_start_time = datetime.now()
+            try:
+                print(f"[Occupancy Reconciliation] Starting at {reconciliation_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                result = reconcile_occupancy_logs(db)
+                db.commit()
+                reconciliation_end_time = datetime.now()
+                duration = (reconciliation_end_time - reconciliation_start_time).total_seconds()
+                print(
+                    f"[Occupancy Reconciliation] Completed at {reconciliation_end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(took {duration:.2f}s) - "
+                    f"Total areas: {result.get('total_areas', 0)} | "
+                    f"Matched: {result.get('matched', 0)} | "
+                    f"Mismatched: {result.get('mismatched', 0)} | "
+                    f"Skipped: {result.get('skipped', 0)} | "
+                    f"Errors: {result.get('errors', 0)}"
+                )
+            except Exception as e:
+                print(f"[Occupancy Reconciliation Error] Fatal error: {e}")
+                import traceback
+                traceback.print_exc()
+                db.rollback()
+                if status is not None:
+                    status["outcome"] = "failure"
+                    status["error_class"] = type(e).__name__
+                    status["error_message"] = str(e)
+            finally:
+                db.close()
+                reconciliation_lock.release()
+
+        if job_execution is None:
+            _run()
+            return
         try:
-            print(f"[Occupancy Reconciliation] Starting at {reconciliation_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # Run the reconciliation function
-            result = reconcile_occupancy_logs(db)
-            
-            # Commit the changes
-            db.commit()
-            
-            reconciliation_end_time = datetime.now()
-            duration = (reconciliation_end_time - reconciliation_start_time).total_seconds()
-            
-            print(
-                f"[Occupancy Reconciliation] Completed at {reconciliation_end_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"(took {duration:.2f}s) - "
-                f"Total areas: {result.get('total_areas', 0)} | "
-                f"Matched: {result.get('matched', 0)} | "
-                f"Mismatched: {result.get('mismatched', 0)} | "
-                f"Skipped: {result.get('skipped', 0)} | "
-                f"Errors: {result.get('errors', 0)}"
-            )
-            
-        except Exception as e:
-            print(f"[Occupancy Reconciliation Error] Fatal error: {e}")
-            import traceback
-            traceback.print_exc()
-            db.rollback()
-        finally:
-            db.close()
-            # Release lock when done
-            reconciliation_lock.release()
+            with job_execution(
+                "occupancy_reconciliation",
+                trigger_source="apscheduler",
+                component_code="scheduler",
+            ) as status:
+                _run(status)
+        except Exception:
+            pass
     
     # Start reconciliation in daemon thread (won't block scheduler shutdown)
     reconciliation_thread = threading.Thread(target=run_reconciliation_in_thread, daemon=True)
@@ -322,6 +423,7 @@ def schedule_occupancy_reconciliation():
 # Start scheduler
 scheduler.start()
 schedule_device_refresh()
+schedule_alert_reconcile()
 schedule_driver_alert_live_reconcile()
 schedule_daily_backfill()
 schedule_occupancy_reconciliation()

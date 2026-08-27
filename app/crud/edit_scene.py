@@ -1,9 +1,35 @@
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
+from typing import Optional
 from app.models.area import Area
 from app.models.processor import Processor
 from app.utils.lutron_helpers import is_processor_reachable
 from app.utils.json_connection import create_ssl_connection, send_json, recv_json
+
+
+def _parse_zone_id_from_href(href) -> Optional[int]:
+    """Best-effort zone id from LEAP href like /zone/123. Never raises."""
+    if not href:
+        return None
+    try:
+        tail = str(href).rstrip("/").split("/")[-1]
+        return int(tail) if tail != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _kelvin_from_white_tuning(assignment: dict):
+    """Extract Kelvin from WhiteTuningLevel / WhiteTuneLevel without assuming shape."""
+    white = assignment.get("WhiteTuningLevel")
+    if white is None:
+        white = assignment.get("WhiteTuneLevel")
+    if isinstance(white, dict):
+        return white.get("Kelvin")
+    if isinstance(white, (int, float)):
+        return int(white)
+    return None
+
+
 def edit_scene_assignments(db: Session, area_id: int, scene_id: int, details: list):
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:
@@ -112,94 +138,154 @@ def edit_scene_assignments(db: Session, area_id: int, scene_id: int, details: li
         recv_json(ssock)
     ssock.close()
     return {"status": "success", "message": "Scene edited successfully"}
+
+
 def get_scene_status(db: Session, area_id: int, scene_id: int):
+    """
+    Read zone-level scene assignments from the processor (LEAP).
+
+    Soft LEAP/parse failures return status=error (HTTP 200 from the route) so
+    Heat Map scene clicks do not become generic 500s across all UI variants.
+    """
     area = db.query(Area).filter(Area.id == area_id).first()
     if not area:
-        return {"status": "error", "message": "Area not found"}
+        return {"status": "error", "message": "Area not found", "details": []}
     processor = db.query(Processor).filter(Processor.id == area.processor_id).first()
     if not processor:
-        return {"status": "error", "message": "Processor not found"}
+        return {"status": "error", "message": "Processor not found", "details": []}
     if not is_processor_reachable(processor.ipv4):
-        return {"status": "error", "message": "Processor not reachable"}
-    ssock = create_ssl_connection(processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4)
+        return {"status": "error", "message": "Processor not reachable", "details": []}
+    ssock = create_ssl_connection(
+        processor.ipv4, processor.mac, processor.system, processor_ipv4=processor.ipv4
+    )
     if not ssock:
-        return {"status": "error", "message": "SSL connection failed"}
-    # Step 1: Build zone name map
-    send_json(ssock, {
-        "CommuniqueType": "ReadRequest",
-        "Header": {"Url": f"/area/{area.code}/associatedzone"}
-    })
-    zone_meta_resp = recv_json(ssock)
-    zone_meta_map = {
-        int(z["href"].split("/")[-1]): z.get("Name", "")
-        for z in zone_meta_resp.get("Body", {}).get("Zones", [])
-    }
+        return {"status": "error", "message": "SSL connection failed", "details": []}
+
     result = []
-    def fetch_assignments(url_key: str, zone_type: str):
+    try:
+        # Step 1: Build zone name map (tolerate null/missing LEAP body)
         send_json(ssock, {
-            "CommuniqueType": "CreateRequest",
-            "Header": {"Url": f"/preset/{scene_id}/{url_key}/commandprocessor"},
-            "Body": {
-                "Command": {
-                    "CommandType": "Filter",
-                    "FilterParameters": {
-                        "Where": {
-                            "Binary": {
-                                "Operator": "=",
-                                "Left": {"Resource": {"href": "$1/assignableresource/associatedarea"}},
-                                "Right": {"Resource": {"href": f"/area/{area.code}"}}
-                            }
-                        }
-                    }
-                }
-            }
+            "CommuniqueType": "ReadRequest",
+            "Header": {"Url": f"/area/{area.code}/associatedzone"}
         })
-        response = recv_json(ssock)
+        zone_meta_resp = recv_json(ssock)
+        zone_meta_map = {}
+        if isinstance(zone_meta_resp, dict):
+            zones = (zone_meta_resp.get("Body") or {}).get("Zones") or []
+            if isinstance(zones, list):
+                for z in zones:
+                    if not isinstance(z, dict):
+                        continue
+                    zid = _parse_zone_id_from_href(z.get("href"))
+                    if zid is None:
+                        continue
+                    zone_meta_map[zid] = z.get("Name", "") or f"Zone {zid}"
+
         body_key_map = {
             "switchedlevelassignment": "SwitchedLevelAssignments",
             "dimmedlevelassignment": "DimmedLevelAssignments",
             "whitetuninglevelassignment": "WhiteTuningLevelAssignments",
-            "shadelevelassignment": "ShadeLevelAssignments"
+            "shadelevelassignment": "ShadeLevelAssignments",
         }
-        assignments = response.get("Body", {}).get(body_key_map[url_key], [])
-        for assignment in assignments:
-            zone_href = assignment.get("AssignableResource", {}).get("href", "")
-            zone_id = int(zone_href.split("/")[-1]) if zone_href else None
-            zone_name = zone_meta_map.get(zone_id, f"Zone {zone_id}")
-            out = {
-                "assignment_href": assignment.get("href"),
-                "zone_id": zone_id,
-                "zone_type": zone_type,
-                "zone_name": zone_name
-            }
-            if zone_type == "switched":
-                out["SwitchedLevel"] = assignment.get("SwitchedLevel")
-            elif zone_type == "dimmed":
-                out.update({
-                    "Level": assignment.get("Level"),
-                    "FadeTime": assignment.get("FadeTime"),
-                    "DelayTime": assignment.get("DelayTime")
-                })
-            elif zone_type == "whitetune":
-                white = assignment.get("WhiteTuningLevel") or assignment.get("WhiteTuneLevel", {})
-                out.update({
-                    "Level": assignment.get("Level"),
-                    "FadeTime": assignment.get("FadeTime"),
-                    "DelayTime": assignment.get("DelayTime"),
-                    "WhiteTuningLevel": {"Kelvin": white.get("Kelvin")}
-                })
-            elif zone_type == "shade":
-                out["Level"] = assignment.get("Level")
-            result.append(out)
-    # Call all 4 assignment types
-    fetch_assignments("switchedlevelassignment", "switched")
-    fetch_assignments("dimmedlevelassignment", "dimmed")
-    fetch_assignments("whitetuninglevelassignment", "whitetune")
-    fetch_assignments("shadelevelassignment", "shade")
-    ssock.close()
+
+        def fetch_assignments(url_key: str, zone_type: str):
+            send_json(ssock, {
+                "CommuniqueType": "CreateRequest",
+                "Header": {"Url": f"/preset/{scene_id}/{url_key}/commandprocessor"},
+                "Body": {
+                    "Command": {
+                        "CommandType": "Filter",
+                        "FilterParameters": {
+                            "Where": {
+                                "Binary": {
+                                    "Operator": "=",
+                                    "Left": {
+                                        "Resource": {
+                                            "href": "$1/assignableresource/associatedarea"
+                                        }
+                                    },
+                                    "Right": {
+                                        "Resource": {"href": f"/area/{area.code}"}
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            })
+            response = recv_json(ssock)
+            if not isinstance(response, dict):
+                # Timeout / empty / non-JSON — skip this assignment type, keep others.
+                return
+            assignments = (response.get("Body") or {}).get(body_key_map[url_key]) or []
+            if not isinstance(assignments, list):
+                return
+            for assignment in assignments:
+                if not isinstance(assignment, dict):
+                    continue
+                assignable = assignment.get("AssignableResource") or {}
+                zone_href = (
+                    assignable.get("href", "") if isinstance(assignable, dict) else ""
+                )
+                zone_id = _parse_zone_id_from_href(zone_href)
+                zone_name = (
+                    zone_meta_map.get(zone_id, f"Zone {zone_id}")
+                    if zone_id is not None
+                    else (zone_meta_map.get(None) or "Zone")
+                )
+                out = {
+                    "assignment_href": assignment.get("href"),
+                    "zone_id": zone_id,
+                    "zone_type": zone_type,
+                    "zone_name": zone_name,
+                }
+                if zone_type == "switched":
+                    out["SwitchedLevel"] = assignment.get("SwitchedLevel")
+                elif zone_type == "dimmed":
+                    out.update({
+                        "Level": assignment.get("Level"),
+                        "FadeTime": assignment.get("FadeTime"),
+                        "DelayTime": assignment.get("DelayTime"),
+                    })
+                elif zone_type == "whitetune":
+                    out.update({
+                        "Level": assignment.get("Level"),
+                        "FadeTime": assignment.get("FadeTime"),
+                        "DelayTime": assignment.get("DelayTime"),
+                        "WhiteTuningLevel": {
+                            "Kelvin": _kelvin_from_white_tuning(assignment)
+                        },
+                    })
+                elif zone_type == "shade":
+                    out["Level"] = assignment.get("Level")
+                result.append(out)
+
+        fetch_assignments("switchedlevelassignment", "switched")
+        fetch_assignments("dimmedlevelassignment", "dimmed")
+        fetch_assignments("whitetuninglevelassignment", "whitetune")
+        fetch_assignments("shadelevelassignment", "shade")
+    except Exception as exc:
+        # Never bubble raw LEAP/parse errors as unhandled 500s to the UI.
+        try:
+            ssock.close()
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "message": f"Scene status fetch failed: {exc}",
+            "area_id": area_id,
+            "scene_id": scene_id,
+            "details": result,
+        }
+
+    try:
+        ssock.close()
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "area_id": area_id,
         "scene_id": scene_id,
-        "details": result
+        "details": result,
     }

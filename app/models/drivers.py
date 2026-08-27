@@ -10,6 +10,8 @@ class Driver(Base):
 
     # References
     processor_id = Column(Integer, ForeignKey("processor.id", ondelete="CASCADE"), nullable=True)  # Added for multi-processor support
+    # Shared across processors in the same Lutron project (see system_identity)
+    system_key = Column(String, nullable=True, index=True)
     area_id = Column(Integer, nullable=True)        # FK to areas.id if needed
     area_code = Column(Integer, nullable=True)      # LEAP area code
     zone_code = Column(Integer, nullable=True)      # LEAP zone code
@@ -20,6 +22,11 @@ class Driver(Base):
 
     # New column for storing friendly device name
     device_name = Column(String, nullable=True)     # e.g., "Living Room Dimmer"
+
+    # Cached location for alerts UI (set once; avoids LEAP path walks on read)
+    area_path = Column(String, nullable=True)
+    # Failed map attempts; stop remapping dummy LCs after threshold
+    area_map_failures = Column(Integer, nullable=False, default=0)
 
     # Alert info
     error_code = Column(String, nullable=True)      # Error identifier

@@ -17,6 +17,9 @@ class SensorAndModule(Base):
     # Processor reference for multi-processor support
     processor_id = Column(Integer, ForeignKey("processor.id", ondelete="CASCADE"), nullable=True)
 
+    # Shared across processors in the same Lutron project (see system_identity)
+    system_key = Column(String, nullable=True, index=True)
+
     # Device identity
     device_code = Column(Integer, nullable=False)   # LEAP device ID (unique per processor)
     device_name = Column(String, nullable=True)
@@ -28,6 +31,10 @@ class SensorAndModule(Base):
     # Area linkage
     area_code = Column(String, nullable=True)  # string allows mixed numeric/text area codes
     area_id = Column(Integer, ForeignKey("areas.id", ondelete="SET NULL"), nullable=True)
+    # Cached location for alerts UI (set once; avoids LEAP path walks on read)
+    area_path = Column(String, nullable=True)
+    # Failed map attempts; stop remapping dummy devices after threshold
+    area_map_failures = Column(Integer, nullable=False, default=0)
 
     # Status
     availability = Column(String, nullable=True)                 # "Available" | "Unavailable" | "Unknown"
